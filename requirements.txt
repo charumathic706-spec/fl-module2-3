@@ -1,0 +1,31 @@
+# ============================================================
+# BATFL — Complete Requirements
+# Install all: pip install -r requirements.txt
+# ============================================================
+
+# Core ML & Data Science
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+imbalanced-learn>=0.11.0
+torch>=2.0.0
+matplotlib>=3.7.0
+
+# Federated Learning
+flwr>=1.5.0
+ray>=2.0.0
+ray>=2.0.0
+
+# Blockchain — Ganache/Ethereum backend
+# (required for --blockchain ganache)
+web3>=6.0.0
+py-solc-x>=1.1.1
+
+# Blockchain — Hyperledger Fabric backend
+# (required for --blockchain fabric)
+# Run AFTER: cd module1/split3/hlf && ./setup.sh
+# No Python Fabric SDK is required; the gateway uses the Fabric peer CLI
+# through WSL and the binaries installed by module1/split3/hlf/setup.sh.
+
+# Utilities
+tqdm>=4.65.0

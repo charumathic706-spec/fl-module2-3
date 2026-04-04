@@ -1,0 +1,30 @@
+[project]
+name = "batfl-final"
+version = "0.1.0"
+description = "BATFL: Blockchain-Based Dynamic Trust Modeling for Federated Fraud Detection"
+license = { text = "MIT" }
+
+[tool.flwr.app]
+publisher = "local"
+
+[tool.flwr.app.components]
+serverapp = "module1.split2.flwr_app:server_app"
+clientapp = "module1.split2.flwr_app:client_app"
+
+[tool.flwr.app.config]
+num_clients = 5
+num_rounds = 20
+model = "dnn"
+use_synthetic = true
+data_path = ""
+alpha = 1.0
+max_samples = ""
+fraction_fit = 1.0
+no_smote = false
+attack = "none"
+malicious = "1"
+attack_start = 1
+scale_factor = 5.0
+log_dir = "logs_split2"
+blockchain_enabled = false
+blockchain_backend = "simulation"

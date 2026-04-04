@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+env/
+.venv/
+
+# Local tooling/temp
+.tmp_flwr_probe/
+*.out
+*.code
+*.probe
+
+# Generated outputs
+logs_split1/
+logs_split2/
+governance_output/
+*.png
+*.npz
+demo_trust_log.json
+hash_chain.json
+
+# Fabric
+organizations/
+channel-artifacts/
+fabric-samples/
+*.tar.gz
+
+# Dataset
+data/creditcard.csv
+data/*.csv
+
+# Ethereum deployment cache
+module1/split3/eth_deployment.json
+
+# Flower/Ray runtime
+*.db
+*.db-journal
+*.db-wal
+ray_results/
+*.rllib/
+
+# Node.js
+node_modules/

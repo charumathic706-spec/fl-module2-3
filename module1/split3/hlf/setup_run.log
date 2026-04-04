@@ -1,0 +1,23 @@
+
+[0;34m[1m━━ Checking prerequisites ━━[0m
+[0;32m[✓][0m Prerequisites OK
+
+[0;34m[1m━━ Getting fabric-samples ━━[0m
+[0;32m[✓][0m fabric-samples already present
+
+[0;34m[1m━━ Downloading Fabric 2.5 binaries and Docker images ━━[0m
+[0;32m[✓][0m Fabric binaries already present
+[0;32m[✓][0m Fabric binaries verified
+
+[0;34m[1m━━ Starting test-network and creating channel ━━[0m
+[0;34mUsing docker and docker-compose[0m
+[0;34mStopping network[0m
+[0;34mRemoving remaining containers[0m
+[0;34mRemoving generated chaincode docker images[0m
+Running: ./network.sh up createChannel -c mychannel -ca -s leveldb
+[0;34mUsing docker and docker-compose[0m
+[0;34mCreating channel 'mychannel'.[0m
+[0;34mIf network is not up, starting nodes with CLI timeout of '5' tries and CLI delay of '3' seconds and using database 'leveldb with crypto from 'Certificate Authorities'[0m
+[0;34mBringing up network[0m
+[0;34mLOCAL_VERSION=v2.5.4[0m
+[0;34mDOCKER_IMAGE_VERSION=v2.5.4[0m
