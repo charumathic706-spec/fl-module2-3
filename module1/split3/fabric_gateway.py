@@ -40,7 +40,7 @@ def create_gateway(
     if use_fabric:
         return _get_fabric(org_msp, allow_fallback=allow_fallback, **kwargs)
     elif not use_simulation:
-        return _get_ganache(org_msp, allow_fallback=allow_fallback)
+        return _get_ganache(org_msp, allow_fallback=allow_fallback, **kwargs)
     else:
         return _get_sim(org_msp)
 
@@ -53,11 +53,11 @@ def _get_sim(org_msp: str) -> Any:
     return SimBlockchainGateway(org_msp=org_msp)
 
 
-def _get_ganache(org_msp: str, allow_fallback: bool = True) -> Any:
+def _get_ganache(org_msp: str, allow_fallback: bool = True, **kwargs) -> Any:
     try:
         from eth_gateway import EthBlockchainGateway
         logger.info("[Gateway] Mode: GANACHE/ETHEREUM")
-        return EthBlockchainGateway(org_msp=org_msp)
+        return EthBlockchainGateway(org_msp=org_msp, **kwargs)
     except ImportError as e:
         if not allow_fallback:
             raise
@@ -82,7 +82,12 @@ def _get_fabric(org_msp: str, allow_fallback: bool = True, **kwargs) -> Any:
                            "  Fix: pip install hf-fabric-gateway grpcio protobuf")
             return _get_sim(org_msp)
         logger.info("[Gateway] Mode: HYPERLEDGER FABRIC")
-        return HLFGateway(msp_id=org_msp, **kwargs)
+        # Keep Fabric isolated from Ethereum-specific kwargs such as
+        # deployment_file/reuse_existing_deployment used by EthBlockchainGateway.
+        fabric_kwargs = {}
+        if "env" in kwargs:
+            fabric_kwargs["env"] = kwargs["env"]
+        return HLFGateway(msp_id=org_msp, **fabric_kwargs)
     except FileNotFoundError as e:
         if not allow_fallback:
             raise

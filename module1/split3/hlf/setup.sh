@@ -22,6 +22,7 @@ PROJECT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 FABRIC_SAMPLES_DIR="$PROJECT_DIR/fabric-samples"
 TEST_NETWORK_DIR="$FABRIC_SAMPLES_DIR/test-network"
 CC_SRC="$SCRIPT_DIR/chaincode/trust_registry"
+CHAINCODE_STAGE_DIR=""
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'; BOLD='\033[1m'
 log()  { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -30,11 +31,13 @@ err()  { echo -e "${RED}[✗]${NC} $1" >&2; exit 1; }
 step() { echo -e "\n${BLUE}${BOLD}━━ $1 ━━${NC}"; }
 
 docker_info_ok() {
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 60 docker info >/dev/null 2>&1
-    else
-        docker info >/dev/null 2>&1
+    # docker info can be slow on WSL when CLI plugins initialize; prefer
+    # a lightweight server check first and avoid hard timeout false negatives.
+    if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+        return 0
     fi
+
+    DOCKER_CLI_HINTS=false docker info >/dev/null 2>&1
 }
 
 wait_for_docker() {
@@ -55,8 +58,9 @@ recover_docker_socket() {
     warn "Trying lightweight Docker recovery for daemon/socket instability..."
     docker version >/dev/null 2>&1 || true
     wait_for_docker 30 2 || true
-    # Prune only build cache to reduce daemon pressure without removing containers/images.
-    docker builder prune -f >/dev/null 2>&1 || true
+    # Reduce daemon pressure before retrying chaincode builds.
+    docker builder prune -af >/dev/null 2>&1 || true
+    docker system prune -f >/dev/null 2>&1 || true
     wait_for_docker 20 2 || true
 }
 
@@ -83,13 +87,26 @@ restart_peer_container() {
     return 1
 }
 
+prepare_chaincode_source() {
+    CHAINCODE_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/batfl-chaincode.XXXXXX")"
+    rm -rf "$CHAINCODE_STAGE_DIR/$CC_NAME"
+    cp -a "$SCRIPT_DIR/chaincode/trust_registry" "$CHAINCODE_STAGE_DIR/$CC_NAME"
+    CC_SRC="$CHAINCODE_STAGE_DIR/$CC_NAME"
+    (
+        cd "$CC_SRC"
+        go mod tidy
+        go mod vendor
+    )
+    trap 'rm -rf "$CHAINCODE_STAGE_DIR"' EXIT
+    log "Staged chaincode source at $CC_SRC"
+}
+
 step "Checking prerequisites"
 command -v docker &>/dev/null || err "Docker not found. Install Docker Desktop."
 docker_info_ok || err "Docker not running or not responsive. Start Docker Desktop and ensure WSL integration is enabled."
 wait_for_docker 15 2 || err "Docker daemon not healthy. Ensure Docker Desktop is fully started and WSL integration is enabled."
 command -v git    &>/dev/null || err "Git not found."
 command -v curl   &>/dev/null || err "curl not found."
-command -v jq     &>/dev/null || err "jq not found. Install it with 'sudo apt-get update && sudo apt-get install -y jq' on Ubuntu/WSL, or 'brew install jq' on macOS."
 log "Prerequisites OK"
 
 step "Getting fabric-samples"
@@ -110,8 +127,9 @@ else
 fi
 
 step "Downloading Fabric 2.5 binaries and Docker images"
-if [ ! -f "$FABRIC_SAMPLES_DIR/bin/peer" ]; then
+if [ ! -x "$FABRIC_SAMPLES_DIR/bin/peer" ] || ! "$FABRIC_SAMPLES_DIR/bin/peer" version >/dev/null 2>&1; then
     cd "$FABRIC_SAMPLES_DIR"
+    warn "Fabric binaries missing or not executable in current shell — downloading fresh binaries..."
     DOWNLOADED=false
     for VER in 2.5.4 2.5.3 2.5.0; do
         if curl -sSL https://raw.githubusercontent.com/hyperledger/fabric/main/scripts/install-fabric.sh \
@@ -129,11 +147,25 @@ fi
 export PATH="$FABRIC_SAMPLES_DIR/bin:$PATH"
 export FABRIC_CFG_PATH="$FABRIC_SAMPLES_DIR/config/"
 for BIN in peer configtxgen cryptogen; do
-    [ -f "$FABRIC_SAMPLES_DIR/bin/$BIN" ] || err "Binary $BIN missing. Delete fabric-samples/ and retry."
+    [ -x "$FABRIC_SAMPLES_DIR/bin/$BIN" ] || err "Binary $BIN missing or not executable. Delete fabric-samples/ and retry."
 done
+if ! peer version >/dev/null 2>&1; then
+    err "Fabric peer binary is present but not runnable in this shell. Re-run setup.sh from WSL so Linux binaries are installed."
+fi
 log "Fabric binaries verified"
 
+prepare_chaincode_source
+
 step "Starting test-network and creating channel"
+
+# Pre-flight Docker health check
+warn "Running Docker health check before network startup..."
+if ! docker run --rm alpine echo "Docker OK" >/dev/null 2>&1; then
+    err "Docker not responding properly. Verify Docker Desktop is running and WSL integration is enabled."
+fi
+docker system prune -f >/dev/null 2>&1 || true
+log "Docker health OK"
+
 cd "$TEST_NETWORK_DIR"
 
 # Remove stale Fabric containers that can hold CA/orderer ports from failed runs
@@ -155,10 +187,24 @@ done
 
 ./network.sh down 2>/dev/null || true
 
-echo "Running: ./network.sh up createChannel -c $CHANNEL_NAME -ca -s leveldb"
-./network.sh up createChannel -c "$CHANNEL_NAME" -ca -s leveldb
-if [ $? -ne 0 ]; then
-    err "network.sh failed to create channel. Check Docker logs: docker logs $(docker ps -a | grep 'fabric' | tail -1 | awk '{print $1}')"
+echo "Running: ./network.sh up createChannel -c $CHANNEL_NAME -s leveldb"
+create_channel_with_retry() {
+    local attempt=1
+    local max_attempts=3
+    while [ "$attempt" -le "$max_attempts" ]; do
+        if ./network.sh up createChannel -c "$CHANNEL_NAME" -s leveldb -r 10 -d 3; then
+            return 0
+        fi
+        warn "network.sh createChannel failed (attempt ${attempt}/${max_attempts}). Cleaning up and retrying..."
+        ./network.sh down 2>/dev/null || true
+        sleep 4
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+if ! create_channel_with_retry; then
+    err "network.sh failed to create channel after retries. Check Docker logs: docker logs $(docker ps -a | grep 'fabric' | tail -1 | awk '{print $1}')"
 fi
 
 log "Network up, channel '$CHANNEL_NAME' created"
@@ -175,8 +221,12 @@ log "Crypto material verified"
 log "Copying crypto material..."
 rm -rf "$PROJECT_DIR/organizations"
 cp -r "$TEST_NETWORK_DIR/organizations" "$PROJECT_DIR/"
-mkdir -p "$PROJECT_DIR/channel-artifacts"
-cp "$TEST_NETWORK_DIR/channel-artifacts/"*.block "$PROJECT_DIR/channel-artifacts/" 2>/dev/null || true
+CHANNEL_ARTIFACTS_DIR="$PROJECT_DIR/channel-artifacts"
+mkdir -p "$CHANNEL_ARTIFACTS_DIR"
+block_file=$(find "$TEST_NETWORK_DIR/channel-artifacts" -maxdepth 1 -type f -name '*.block' -print -quit)
+if [ -n "$block_file" ]; then
+    cp "$block_file" "$CHANNEL_ARTIFACTS_DIR/mychannel.block"
+fi
 
 step "Building and deploying trust-registry chaincode"
 export CORE_PEER_TLS_ENABLED=true
@@ -184,11 +234,61 @@ ORDERER_CA="$PROJECT_DIR/organizations/ordererOrganizations/example.com/orderers
 PEER1_TLS="$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt"
 PEER2_TLS="$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt"
 
+DEPLOYED_WITH_NETWORK_SH=false
+if [ "${BATFL_TRY_NETWORK_DEPLOYCC:-false}" = "true" ]; then
+    cd "$TEST_NETWORK_DIR"
+    if ./network.sh deployCC -c "$CHANNEL_NAME" -ccn "$CC_NAME" -ccp "$CC_SRC" -ccl go -ccv "$CC_VERSION" -ccs "$CC_SEQUENCE"; then
+        log "Chaincode deployed via network.sh deployCC"
+        DEPLOYED_WITH_NETWORK_SH=true
+    else
+        warn "network.sh deployCC failed; falling back to manual lifecycle flow"
+        DEPLOYED_WITH_NETWORK_SH=false
+    fi
+    cd "$PROJECT_DIR"
+else
+    warn "Skipping network.sh deployCC (set BATFL_TRY_NETWORK_DEPLOYCC=true to enable). Using manual lifecycle flow directly."
+fi
+
+if [ "$DEPLOYED_WITH_NETWORK_SH" = true ]; then
+    step "Smoke test"
+    cd "$TEST_NETWORK_DIR"
+
+    set_org1() {
+        export CORE_PEER_LOCALMSPID="Org1MSP"
+        export CORE_PEER_TLS_ROOTCERT_FILE="$PEER1_TLS"
+        export CORE_PEER_MSPCONFIGPATH="$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp"
+        export CORE_PEER_ADDRESS="localhost:7051"
+    }
+
+    set_org1
+    peer chaincode invoke \
+        -o localhost:7050 --ordererTLSHostnameOverride orderer.example.com \
+        --tls --cafile "$ORDERER_CA" -C "$CHANNEL_NAME" -n "$CC_NAME" \
+        --peerAddresses localhost:7051 --tlsRootCertFiles "$PEER1_TLS" \
+        --peerAddresses localhost:9051 --tlsRootCertFiles "$PEER2_TLS" \
+        -c '{"function":"RegisterModel","Args":["1","abc123","blk001","GENESIS","0.85","0.92","[0,1,2]","[]","4","512"]}' 2>&1
+    sleep 5
+    RESULT=$(peer chaincode query -C "$CHANNEL_NAME" -n "$CC_NAME" \
+        -c '{"function":"GetModel","Args":["1"]}' 2>&1)
+    if echo "$RESULT" | python3 -c "import json,sys;d=json.load(sys.stdin);assert d['round']==1" 2>/dev/null; then
+        log "Smoke test PASSED ✅"
+    else
+        warn "Smoke test inconclusive — retry in 10s: peer chaincode query -C mychannel -n trust-registry -c '{\"function\":\"GetModel\",\"Args\":[\"1\"]}'"
+    fi
+    cd "$PROJECT_DIR"
+else
+
 if command -v go &>/dev/null; then
     cd "$CC_SRC"
     # Keep chaincode in module mode to avoid stale vendor tree issues during Fabric builds.
-    rm -rf vendor
+    if [ -d vendor ]; then
+        chmod -R u+w vendor 2>/dev/null || true
+        rm -rf vendor 2>/dev/null || true
+    fi
+    export GOPROXY=direct,off
+    export GO111MODULE=on
     go mod download 2>&1 | tail -5 || true
+    go mod vendor 2>&1 | tail -20 || true
     cd "$PROJECT_DIR"
 else
     warn "Go not found — chaincode packaging may fail. Install: https://go.dev/dl/"
@@ -202,6 +302,13 @@ package_chaincode() {
 
 package_chaincode
 log "Chaincode packaged"
+
+# Pre-install cleanup to reduce probability of docker.sock broken-pipe during peer image build.
+recover_docker_socket
+    if [ "${BATFL_RESTART_PEERS_ON_INSTALL_ERROR:-false}" = "true" ]; then
+        restart_peer_container "Org1" || true
+        restart_peer_container "Org2" || true
+    fi
 
 set_org1() {
     export CORE_PEER_LOCALMSPID="Org1MSP"
@@ -219,8 +326,8 @@ set_org2() {
 install_chaincode() {
     local org_name="$1"
     local attempts=1
-    local max_attempts=3
-    local backoff=5
+    local max_attempts=6
+    local backoff=15
     local output
     while [ "$attempts" -le "$max_attempts" ]; do
         if output=$(peer lifecycle chaincode install /tmp/trust-registry.tar.gz 2>&1); then
@@ -245,16 +352,21 @@ install_chaincode() {
             recover_docker_socket
         fi
 
-        if echo "$output" | grep -Eqi "timeout expired while executing transaction|keepalive ping failed|rpc error: code = Unavailable|failed to get chaincode package|no such file or directory"; then
+        if echo "$output" | grep -Eqi "timeout expired while executing transaction|keepalive ping failed|rpc error: code = Unavailable|failed to get chaincode package|no such file or directory|context deadline exceeded"; then
             warn "Detected peer/build runtime instability while installing on ${org_name}."
             recover_docker_socket
-            restart_peer_container "$org_name" || true
+            if [ "${BATFL_RESTART_PEERS_ON_INSTALL_ERROR:-false}" = "true" ]; then
+                restart_peer_container "$org_name" || true
+            fi
             package_chaincode || true
+            sleep 15  # Increased from 10 to give peer more time to recover
         fi
 
-        warn "Chaincode install failed on ${org_name} (attempt ${attempts}/${max_attempts}). Retrying..."
-        sleep "$backoff"
-        backoff=$((backoff + 5))
+        warn "Chaincode install failed on ${org_name} (attempt ${attempts}/${max_attempts}). Waiting before retry..."
+        # Exponential backoff with jitter: backoff * 2^(attempts-1)
+        local sleep_time=$((backoff * (2 ** (attempts - 1))))
+        warn "Waiting ${sleep_time} seconds before attempt $((attempts + 1))..."
+        sleep "$sleep_time"
         attempts=$((attempts + 1))
     done
     err "Chaincode install failed on ${org_name} after ${max_attempts} attempts. Check Docker Desktop logs, WSL integration, and run: docker info ; docker system df"
@@ -271,20 +383,55 @@ CC_PACKAGE_ID=$(peer lifecycle chaincode queryinstalled 2>&1 \
 log "Package ID: $CC_PACKAGE_ID"
 
 APPROVE_ARGS="-o localhost:7050 --ordererTLSHostnameOverride orderer.example.com \
+    --connTimeout 20s \
     --channelID $CHANNEL_NAME --name $CC_NAME --version $CC_VERSION \
     --package-id $CC_PACKAGE_ID --sequence $CC_SEQUENCE --tls --cafile $ORDERER_CA"
 
-set_org1; eval "peer lifecycle chaincode approveformyorg $APPROVE_ARGS"; log "Org1 approved"
-set_org2; eval "peer lifecycle chaincode approveformyorg $APPROVE_ARGS"; log "Org2 approved"
+approve_chaincode() {
+    local org_name="$1"
+    local set_fn="$2"
+    local attempts=1
+    local max_attempts=5
+    local backoff=5
+    while [ "$attempts" -le "$max_attempts" ]; do
+        if "$set_fn" && eval "peer lifecycle chaincode approveformyorg $APPROVE_ARGS"; then
+            log "${org_name} approved"
+            return 0
+        fi
+        warn "Chaincode approval failed on ${org_name} (attempt ${attempts}/${max_attempts}). Retrying..."
+        sleep "$backoff"
+        backoff=$((backoff + 5))
+        attempts=$((attempts + 1))
+    done
+    err "Chaincode approval failed on ${org_name} after ${max_attempts} attempts. Check orderer logs."
+}
+
+approve_chaincode "Org1" set_org1
+approve_chaincode "Org2" set_org2
 
 set_org1
-peer lifecycle chaincode commit \
-    -o localhost:7050 --ordererTLSHostnameOverride orderer.example.com \
-    --channelID "$CHANNEL_NAME" --name "$CC_NAME" --version "$CC_VERSION" \
-    --sequence $CC_SEQUENCE --tls --cafile "$ORDERER_CA" \
-    --peerAddresses localhost:7051 --tlsRootCertFiles "$PEER1_TLS" \
-    --peerAddresses localhost:9051 --tlsRootCertFiles "$PEER2_TLS"
-log "Chaincode committed"
+commit_attempts=1
+commit_max_attempts=5
+commit_backoff=5
+while [ "$commit_attempts" -le "$commit_max_attempts" ]; do
+    if peer lifecycle chaincode commit \
+        -o localhost:7050 --ordererTLSHostnameOverride orderer.example.com \
+        --connTimeout 20s \
+        --channelID "$CHANNEL_NAME" --name "$CC_NAME" --version "$CC_VERSION" \
+        --sequence $CC_SEQUENCE --tls --cafile "$ORDERER_CA" \
+        --peerAddresses localhost:7051 --tlsRootCertFiles "$PEER1_TLS" \
+        --peerAddresses localhost:9051 --tlsRootCertFiles "$PEER2_TLS"; then
+        log "Chaincode committed"
+        break
+    fi
+    warn "Chaincode commit failed (attempt ${commit_attempts}/${commit_max_attempts}). Retrying..."
+    sleep "$commit_backoff"
+    commit_backoff=$((commit_backoff + 5))
+    commit_attempts=$((commit_attempts + 1))
+done
+if [ "$commit_attempts" -gt "$commit_max_attempts" ]; then
+    err "Chaincode commit failed after ${commit_max_attempts} attempts. Check orderer logs."
+fi
 sleep 5
 
 step "Smoke test"
@@ -302,6 +449,7 @@ if echo "$RESULT" | python3 -c "import json,sys;d=json.load(sys.stdin);assert d[
     log "Smoke test PASSED ✅"
 else
     warn "Smoke test inconclusive — retry in 10s: peer chaincode query -C mychannel -n trust-registry -c '{\"function\":\"GetModel\",\"Args\":[\"1\"]}'"
+fi
 fi
 
 step "Writing Python connection config"

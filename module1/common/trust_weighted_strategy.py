@@ -101,6 +101,7 @@ class TrustWeightedFedAvg(Strategy):
         # State tracking
         self.current_global_params: Optional[List[np.ndarray]] = None
         self.round_logs:  List[Dict] = []
+        self._pending_round_logs: Dict[int, Dict] = {}
         self.best_f1:     float = 0.0
         self.best_round:  int   = 0
 
@@ -223,8 +224,8 @@ class TrustWeightedFedAvg(Strategy):
         model_hash = self._hash_params(aggregated_params)
         print(f"\n  [ModelHash] {model_hash[:16]}...  (-> Split 3 blockchain log)")
 
-        # -- Save round metadata -----------------------------------------------
-        self._save_round_log(
+        # -- Save pending round metadata (finalized after evaluate) ------------
+        self._pending_round_logs[server_round] = self._build_round_log(
             server_round, trust_result, model_hash,
             {cid: m for _, fit_res in results
              for cid, m in [(int(fit_res.metrics.get("client_id", 0)), fit_res.metrics)]}
@@ -295,9 +296,10 @@ class TrustWeightedFedAvg(Strategy):
             self.best_round = server_round
             print(f"  * New best model! F1={global_f1:.4f} at round {server_round}")
 
-        # Update last round log with eval metrics
-        if self.round_logs:
-            self.round_logs[-1].update({
+        # Finalize this round entry, then commit to blockchain before log flush.
+        round_log = self._pending_round_logs.get(server_round)
+        if round_log is not None:
+            round_log.update({
                 "global_f1":               global_f1,
                 "global_auc":              global_auc,
                 "global_recall":           global_metrics.get("recall", 0),
@@ -311,16 +313,25 @@ class TrustWeightedFedAvg(Strategy):
                 "global_tn":               global_metrics.get("tn", 0),
                 "global_fn":               global_metrics.get("fn", 0),
             })
-            self._flush_logs()
 
-            # MODULE 2 INTEGRATION
+            # Boundary 2: sign+commit round attestation before next round begins.
             if self.governance_engine is not None:
                 try:
-                    self.governance_engine.process_round(self.round_logs[-1])
+                    gov_record = self.governance_engine.process_round(round_log)
+                    round_log.update({
+                        "blockchain_tx_id": gov_record.blockchain_tx_id,
+                        "audit_tx_id": gov_record.audit_tx_id,
+                    })
                 except Exception as _ge:
                     raise RuntimeError(
                         f"[Module 2] Governance failure at round {server_round}: {_ge}"
                     ) from _ge
+
+            self.round_logs.append(round_log)
+            self._pending_round_logs.pop(server_round, None)
+            self._flush_logs()
+        else:
+            print(f"  [Warn] Missing pending round log for round {server_round}; skipping flush.")
 
         return float(weighted_loss), global_metrics
 
@@ -357,14 +368,14 @@ class TrustWeightedFedAvg(Strategy):
 
     # -- Logging ---------------------------------------------------------------
 
-    def _save_round_log(
+    def _build_round_log(
         self,
         round_num:    int,
         result:       AggregationResult,
         model_hash:   str,
         client_fit_metrics: Dict,
-    ) -> None:
-        """Save round metadata -- structured for Split 3 blockchain consumption."""
+    ) -> Dict:
+        """Build per-round metadata to be finalized after evaluation metrics arrive."""
         trust_summary = self.trust_scorer.get_trust_summary()
         log = {
             "round":           round_num,
@@ -384,8 +395,7 @@ class TrustWeightedFedAvg(Strategy):
             "global_f1":       0.0,
             "global_auc":      0.0,
         }
-        self.round_logs.append(log)
-        self._flush_logs()
+        return log
 
     def _flush_logs(self) -> None:
         path = os.path.join(self.log_dir, "trust_training_log.json")

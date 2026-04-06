@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Dict, List, Tuple
+
+import numpy as np
 
 from flwr.client import ClientApp
 from flwr.common import Context
@@ -68,6 +72,33 @@ def _load_partitions(run_config: Dict) -> Dict[int, Dict]:
     return part_map
 
 
+def _partitions_cache_path(cfg: Dict) -> str:
+    log_dir = str(cfg.get("log_dir", "logs_split2"))
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, ".partition_cache_flwr_app.npz")
+
+
+def _save_partition_cache(partitions: Dict[int, Dict], path: str) -> None:
+    arrays = {}
+    for cid, p in partitions.items():
+        arrays[f"{cid}_X_train"] = p["X_train"]
+        arrays[f"{cid}_y_train"] = p["y_train"]
+        arrays[f"{cid}_X_test"] = p["X_test"]
+        arrays[f"{cid}_y_test"] = p["y_test"]
+    np.savez_compressed(path, **arrays)
+
+
+def _load_partition_from_cache(path: str, cid: int) -> Dict:
+    d = np.load(path)
+    return {
+        "client_id": cid,
+        "X_train": d[f"{cid}_X_train"],
+        "y_train": d[f"{cid}_y_train"],
+        "X_test": d[f"{cid}_X_test"],
+        "y_test": d[f"{cid}_y_test"],
+    }
+
+
 def _build_attacker(run_config: Dict):
     attack = str(run_config.get("attack", "none")).strip().lower()
     malicious = _csv_ints(str(run_config.get("malicious", "1")))
@@ -93,8 +124,8 @@ def _build_server_components(context: Context) -> ServerAppComponents:
     fraction_fit = float(cfg.get("fraction_fit", 1.0))
     log_dir = str(cfg.get("log_dir", "logs_split2"))
 
-    blockchain_enabled = _to_bool(cfg.get("blockchain_enabled", False), False)
-    blockchain_backend = str(cfg.get("blockchain_backend", "simulation"))
+    blockchain_enabled = _to_bool(cfg.get("blockchain_enabled", True), True)
+    blockchain_backend = str(cfg.get("blockchain_backend", "fabric"))
 
     governance_engine = None
     if blockchain_enabled:
@@ -113,6 +144,11 @@ def _build_server_components(context: Context) -> ServerAppComponents:
         governance_engine=governance_engine,
     )
 
+    # Precompute and persist partitions once for all ClientApp actors.
+    part_map = _load_partitions(cfg)
+    cache_path = _partitions_cache_path(cfg)
+    _save_partition_cache(part_map, cache_path)
+
     return ServerAppComponents(
         strategy=strategy,
         config=ServerConfig(num_rounds=rounds),
@@ -130,9 +166,19 @@ def _client_fn(context: Context):
     attack_start = int(cfg.get("attack_start", 1))
 
     partition_id = int(context.node_config.get("partition-id", context.node_id))
-    cid = partition_id % max(num_clients, 1)
+    if partition_id >= num_clients:
+        raise ValueError(
+            f"partition-id {partition_id} is out of range for num_clients={num_clients}. "
+            "Set Flower supernodes equal to num_clients."
+        )
+    cid = partition_id
 
-    part = _load_partitions(cfg)[cid]
+    cache_path = _partitions_cache_path(cfg)
+    if Path(cache_path).exists():
+        part = _load_partition_from_cache(cache_path, cid)
+    else:
+        # Fallback in case cache is missing (first actor race / manual runs).
+        part = _load_partitions(cfg)[cid]
 
     is_label_flip = attack in {"label_flip", "combined"} and (cid in set(malicious))
 

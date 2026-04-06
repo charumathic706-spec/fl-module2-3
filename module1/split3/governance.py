@@ -21,6 +21,8 @@ Output: governance_report.json   (hash chain + audit trail + tamper events)
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -156,11 +158,13 @@ class GovernanceEngine:
     def __init__(self, config: Optional[GovernanceConfig] = None) -> None:
         self.cfg     = config or GovernanceConfig()
         self.hasher  = ModelHasher()
+        os.makedirs(self.cfg.output_dir, exist_ok=True)
         self.gateway = create_gateway(
             use_simulation=self.cfg.use_simulation,
             use_fabric=self.cfg.use_fabric,
             org_msp=self.cfg.org_msp,
             allow_fallback=not self.cfg.require_backend_match,
+            deployment_file=os.path.join(self.cfg.output_dir, "eth_deployment.json"),
         )
 
         self._active_backend = self._detect_active_backend()
@@ -178,8 +182,10 @@ class GovernanceEngine:
         self._quarantined_clients:   set            = set()
         self._best_f1:               float          = 0.0
         self._best_round:            int            = 0
+        self._attest_algo:           str            = "HMAC-SHA256"
+        self._attest_key_id:         str            = os.getenv("BATFL_ATTESTATION_KEY_ID", "coordinator-default")
+        self._attest_key:            bytes          = self._load_attestation_key()
 
-        os.makedirs(self.cfg.output_dir, exist_ok=True)
         print(f"\n[Governance] Engine initialised")
         print(f"  Mode:      {'SIMULATION' if self.cfg.use_simulation else ('FABRIC' if self.cfg.use_fabric else 'GANACHE')}")
         print(f"  Output:    {self.cfg.output_dir}")
@@ -252,7 +258,40 @@ class GovernanceEngine:
         )
         quarantined_now = list(self._quarantined_clients)
 
-        # 3. Register on blockchain
+        # 3. Build signed attestation payload and commit it on-chain first.
+        attestation_payload = self._build_attestation_payload(
+            round_num=rnd,
+            model_hash=hash_record.model_hash,
+            block_hash=hash_record.block_hash,
+            prev_block_hash=hash_record.prev_block_hash,
+            global_f1=global_f1,
+            global_auc=global_auc,
+            trusted=trusted,
+            flagged=flagged,
+            trust_scores=trust_scores,
+            anomaly_scores=anomaly_scores,
+        )
+        provided_sig = str(log_entry.get("attestation_signature", "")).strip()
+        if provided_sig:
+            attestation_payload["attestation_signature"] = provided_sig
+            attestation_payload["signature_verified"] = self.verify_attestation_signature(attestation_payload)
+            if not attestation_payload["signature_verified"]:
+                raise RuntimeError(
+                    f"Invalid attestation signature at round {rnd}. Refusing commit."
+                )
+        else:
+            signature = self._sign_attestation_payload(attestation_payload)
+            attestation_payload["attestation_signature"] = signature
+            attestation_payload["signature_verified"] = True
+
+        attestation_tx = self.gateway.append_audit_event(
+            event_type="ROUND_ATTESTED",
+            round_num=rnd,
+            data=attestation_payload,
+            actor=self.cfg.audit_actor,
+        )
+
+        # 4. Register on blockchain model registry
         tx_id, ok = self.gateway.register_model(
             round_num=rnd,
             model_hash=hash_record.model_hash,
@@ -271,7 +310,7 @@ class GovernanceEngine:
                 "Stopping to preserve governance integrity."
             )
 
-        # 4. Periodic chain verification
+        # 5. Periodic chain verification
         tamper_alerts: List[str] = []
         chain_intact = True
         if rnd % self.cfg.verify_chain_every_n == 0 or rnd == 1:
@@ -289,7 +328,7 @@ class GovernanceEngine:
                         severity="CRITICAL",
                     )
 
-        # 5. Raise alerts for newly quarantined clients
+        # 6. Raise alerts for newly quarantined clients
         for cid in newly_quarantined:
             alert_msg = (f"CLIENT_QUARANTINED: client {cid} "
                          f"flagged {self.cfg.consecutive_flag_limit} consecutive rounds")
@@ -301,13 +340,17 @@ class GovernanceEngine:
                 severity="HIGH",
             )
 
-        # 6. Audit trail event
+        # 7. Audit trail event
         audit_tx = self.gateway.append_audit_event(
             event_type="ROUND_COMMITTED",
             round_num=rnd,
             data={
                 "model_hash":          hash_record.model_hash,
                 "block_hash":          hash_record.block_hash,
+                "attestation_tx_id":    attestation_tx,
+                "attestation_key_id":   attestation_payload["attestation_key_id"],
+                "attestation_algo":     attestation_payload["attestation_algo"],
+                "attestation_signature": attestation_payload["attestation_signature"],
                 "global_f1":           global_f1,
                 "global_auc":          global_auc,
                 "trusted_clients":     trusted,
@@ -338,7 +381,110 @@ class GovernanceEngine:
             audit_tx_id=audit_tx,
         )
         self._round_records.append(record)
+        # Persist incremental governance artifacts so live dashboards can read
+        # commit/audit telemetry without waiting for end-of-run finalization.
+        self.export_reports()
         return record
+
+    def verify_attestation_signature(self, payload: Dict[str, Any]) -> bool:
+        """Verify an attestation signature from canonical payload fields."""
+        given = str(payload.get("attestation_signature", "")).strip()
+        if not given:
+            return False
+        canonical = self._attestation_digest(payload)
+        expected = hmac.new(self._attest_key, canonical.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(given, expected)
+
+    def verify_round_from_blockchain(self, round_num: int) -> Dict[str, Any]:
+        """
+        Read attestation + model commit from blockchain and independently verify
+        attestation signature and model-hash consistency.
+        """
+        model_record = None
+        if hasattr(self.gateway, "get_model_record"):
+            model_record = self.gateway.get_model_record(round_num)
+
+        audit_events = self.gateway.get_audit_trail()
+        attested_events = [
+            e for e in audit_events
+            if int(e.get("round", -1)) == int(round_num)
+            and e.get("event_type") == "ROUND_ATTESTED"
+        ]
+        if not attested_events:
+            return {
+                "round": round_num,
+                "verified": False,
+                "reason": "ROUND_ATTESTED event not found on chain",
+            }
+
+        latest = attested_events[-1]
+        payload = dict(latest.get("data", {}))
+        sig_ok = self.verify_attestation_signature(payload)
+
+        if not model_record:
+            return {
+                "round": round_num,
+                "verified": False,
+                "reason": "MODEL record not found on chain",
+                "signature_valid": bool(sig_ok),
+                "model_hash_match": False,
+                "attestation_key_id": payload.get("attestation_key_id"),
+                "attestation_algo": payload.get("attestation_algo"),
+                "attestation_event_id": latest.get("event_id"),
+                "blockchain_model_hash": None,
+                "attested_model_hash": payload.get("model_hash"),
+            }
+
+        chain_model_hash = (
+            model_record.get("model_hash")
+            or model_record.get("modelHash")
+            or model_record.get("stored_hash")
+        )
+        payload_model_hash = payload.get("model_hash")
+        hash_match = bool(chain_model_hash and payload_model_hash and chain_model_hash == payload_model_hash)
+
+        return {
+            "round": round_num,
+            "verified": bool(sig_ok and hash_match),
+            "signature_valid": bool(sig_ok),
+            "model_hash_match": bool(hash_match),
+            "attestation_key_id": payload.get("attestation_key_id"),
+            "attestation_algo": payload.get("attestation_algo"),
+            "attestation_event_id": latest.get("event_id"),
+            "blockchain_model_hash": chain_model_hash,
+            "attested_model_hash": payload_model_hash,
+        }
+
+    def get_committed_round_numbers(self) -> List[int]:
+        """Return round numbers discoverable from blockchain state only."""
+        rounds: List[int] = []
+        if hasattr(self.gateway, "get_all_model_records"):
+            records = self.gateway.get_all_model_records()
+            for rec in records:
+                rnd = rec.get("round")
+                if rnd is not None:
+                    rounds.append(int(rnd))
+        elif hasattr(self.gateway, "get_block_count"):
+            count = int(self.gateway.get_block_count())
+            # Simulation includes genesis block; real backends return round count.
+            if self._active_backend == "simulation":
+                count = max(0, count - 1)
+            rounds = list(range(1, count + 1))
+        return sorted(set(rounds))
+
+    def audit_blockchain_attestations(self) -> Dict[str, Any]:
+        """Perform read-only attestation verification for all committed rounds."""
+        rounds = self.get_committed_round_numbers()
+        results = [self.verify_round_from_blockchain(rnd) for rnd in rounds]
+        verified = [r for r in results if r.get("verified")]
+        failed = [r for r in results if not r.get("verified")]
+        return {
+            "round_count": len(rounds),
+            "verified_count": len(verified),
+            "failed_count": len(failed),
+            "all_verified": len(failed) == 0,
+            "results": results,
+        }
 
     def run_tamper_simulation(
         self,
@@ -486,3 +632,57 @@ class GovernanceEngine:
         if name == "SimBlockchainGateway":
             return "simulation"
         return "unknown"
+
+    def _load_attestation_key(self) -> bytes:
+        key = os.getenv("BATFL_ATTESTATION_KEY", "batfl-dev-attestation-key")
+        return key.encode("utf-8")
+
+    def _build_attestation_payload(
+        self,
+        round_num: int,
+        model_hash: str,
+        block_hash: str,
+        prev_block_hash: str,
+        global_f1: float,
+        global_auc: float,
+        trusted: List[int],
+        flagged: List[int],
+        trust_scores: Dict[str, Any],
+        anomaly_scores: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload = {
+            "schema": "batfl.round-attestation.v1",
+            "round": int(round_num),
+            "model_hash": str(model_hash),
+            "block_hash": str(block_hash),
+            "prev_block_hash": str(prev_block_hash),
+            "global_f1": round(float(global_f1), 6),
+            "global_auc": round(float(global_auc), 6),
+            "trusted_clients": sorted(int(c) for c in (trusted or [])),
+            "flagged_clients": sorted(int(c) for c in (flagged or [])),
+            "trust_scores": self._normalize_score_map(trust_scores),
+            "anomaly_scores": self._normalize_score_map(anomaly_scores),
+            "attestation_algo": self._attest_algo,
+            "attestation_key_id": self._attest_key_id,
+        }
+        return payload
+
+    def _sign_attestation_payload(self, payload: Dict[str, Any]) -> str:
+        canonical = self._attestation_digest(payload)
+        return hmac.new(self._attest_key, canonical.encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _normalize_score_map(raw: Dict[str, Any]) -> Dict[str, float]:
+        normalized: Dict[str, float] = {}
+        for k, v in (raw or {}).items():
+            normalized[str(k)] = round(float(v), 8)
+        return dict(sorted(normalized.items(), key=lambda kv: kv[0]))
+
+    @staticmethod
+    def _attestation_digest(payload: Dict[str, Any]) -> str:
+        signable = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"attestation_signature", "signature_verified"}
+        }
+        return json.dumps(signable, sort_keys=True, separators=(",", ":"))

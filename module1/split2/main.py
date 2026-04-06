@@ -223,7 +223,7 @@ def build_parser():
     # Blockchain (Module 2)
     p.add_argument("--blockchain",   type=str,   default="simulation",
                    choices=["simulation", "ganache", "fabric"],
-                   help="Blockchain backend for live governance during training")
+                   help="Blockchain backend for live governance during training (default: simulation)")
     p.add_argument("--no_blockchain", action="store_true",
                    help="Disable Module 2 entirely (Module 1 only mode)")
 
