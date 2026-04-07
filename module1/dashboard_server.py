@@ -13,6 +13,7 @@
 #   Terminal 1: python -m module1.split2.main --data_path data/creditcard.csv \
 #                   --attack label_flip --malicious 1
 #   Terminal 2: python dashboard_server.py --log logs_split2/trust_training_log.json
+                #python module1/dashboard_server.py --log logs_split2/trust_training_log.json --port 5000 
 #   Browser:    http://localhost:5000
 #
 # FOR TWO-MACHINE SETUP:
