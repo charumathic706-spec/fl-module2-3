@@ -86,6 +86,8 @@ class HLFGateway:
         self._project_root = Path(__file__).resolve().parents[2]
         self._hlf_dir_wsl = _to_wsl_path(str(self._project_root / "module1" / "split3" / "hlf"))
         self._fabric_bin_wsl = _to_wsl_path(str(self._project_root / "fabric-samples" / "bin"))
+        self._fabric_cfg_wsl = _to_wsl_path(str(self._project_root / "fabric-samples" / "config"))
+        self._test_network_dir_wsl = _to_wsl_path(str(self._project_root / "fabric-samples" / "test-network"))
         self._orderer_ca = self._wsl_path(env["FABRIC_ORDERER_TLS_CERT"])
         self._peer1_tls = self._wsl_path(env["FABRIC_ORG1_TLS_CERT"])
         self._peer2_tls = self._wsl_path(env["FABRIC_ORG2_TLS_CERT"])
@@ -228,6 +230,10 @@ class HLFGateway:
                 text=True,
             )
             output = (result.stdout or "") + (result.stderr or "")
+            if result.returncode != 0:
+                msg = (result.stderr or result.stdout or "").strip()
+                logger.error(f"[HLF] Submit {fn} failed: {msg}")
+                return f"error:{msg[:180]}", False
             tx_id = self._derive_tx_id(fn, args, output)
             return tx_id, result.returncode == 0
         except Exception as e:
@@ -256,10 +262,12 @@ class HLFGateway:
             return None
 
     def _build_peer_command(self, peer_args: List[str]) -> str:
-        exports = [f"export PATH={shlex.quote(self._fabric_bin_wsl)}:$PATH"]
+        safe_path = f"{self._fabric_bin_wsl}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        exports = [f"export PATH={shlex.quote(safe_path)}"]
+        exports.append(f"export FABRIC_CFG_PATH={shlex.quote(self._fabric_cfg_wsl)}")
         for key, value in self._peer_env.items():
             exports.append(f"export {key}={shlex.quote(value)}")
-        exports.append(f"cd {shlex.quote(self._hlf_dir_wsl)}")
+        exports.append(f"cd {shlex.quote(self._test_network_dir_wsl)}")
         exports.append("peer " + " ".join(shlex.quote(part) for part in peer_args))
         return " && ".join(exports)
 

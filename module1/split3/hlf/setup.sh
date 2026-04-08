@@ -13,7 +13,8 @@ set -euo pipefail
 
 CHANNEL_NAME="mychannel"
 CC_NAME="trust-registry"
-CC_VERSION="1.0"
+CC_VERSION="1.2"
+# Channel is recreated by setup each run, so definition sequence must start at 1.
 CC_SEQUENCE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,7 +96,15 @@ prepare_chaincode_source() {
     (
         cd "$CC_SRC"
         go mod tidy
-        go mod vendor
+        # Keep chaincode in module mode to reduce package size and avoid
+        # oversized vendor payloads stressing Docker socket/build paths.
+        if [ -d vendor ]; then
+            chmod -R u+w vendor 2>/dev/null || true
+            rm -rf vendor 2>/dev/null || true
+        fi
+        export GOPROXY=https://proxy.golang.org,direct
+        export GO111MODULE=on
+        go mod download
     )
     trap 'rm -rf "$CHAINCODE_STAGE_DIR"' EXIT
     log "Staged chaincode source at $CC_SRC"
@@ -228,6 +237,27 @@ if [ -n "$block_file" ]; then
     cp "$block_file" "$CHANNEL_ARTIFACTS_DIR/mychannel.block"
 fi
 
+write_connection_config() {
+    cat > "$SCRIPT_DIR/fabric_connection.env" << ENV
+FABRIC_CHANNEL=$CHANNEL_NAME
+FABRIC_CHAINCODE=$CC_NAME
+FABRIC_PEER_ORG1_ENDPOINT=localhost:7051
+FABRIC_PEER_ORG2_ENDPOINT=localhost:9051
+FABRIC_ORG1_MSP_ID=Org1MSP
+FABRIC_ORG2_MSP_ID=Org2MSP
+FABRIC_ORG1_CERT=$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp/signcerts/Admin@org1.example.com-cert.pem
+FABRIC_ORG1_KEY_DIR=$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp/keystore
+FABRIC_ORG1_TLS_CERT=$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt
+FABRIC_ORG2_CERT=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/users/Admin@org2.example.com/msp/signcerts/Admin@org2.example.com-cert.pem
+FABRIC_ORG2_KEY_DIR=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/users/Admin@org2.example.com/msp/keystore
+FABRIC_ORG2_TLS_CERT=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt
+FABRIC_ORDERER_TLS_CERT=$PROJECT_DIR/organizations/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem
+ENV
+    log "Config written: $SCRIPT_DIR/fabric_connection.env"
+}
+
+write_connection_config
+
 step "Building and deploying trust-registry chaincode"
 export CORE_PEER_TLS_ENABLED=true
 ORDERER_CA="$PROJECT_DIR/organizations/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem"
@@ -266,14 +296,14 @@ if [ "$DEPLOYED_WITH_NETWORK_SH" = true ]; then
         --tls --cafile "$ORDERER_CA" -C "$CHANNEL_NAME" -n "$CC_NAME" \
         --peerAddresses localhost:7051 --tlsRootCertFiles "$PEER1_TLS" \
         --peerAddresses localhost:9051 --tlsRootCertFiles "$PEER2_TLS" \
-        -c '{"function":"RegisterModel","Args":["1","abc123","blk001","GENESIS","0.85","0.92","[0,1,2]","[]","4","512"]}' 2>&1
+        -c '{"function":"AppendEvent","Args":["SMOKE","0","setup","{}"]}' 2>&1
     sleep 5
     RESULT=$(peer chaincode query -C "$CHANNEL_NAME" -n "$CC_NAME" \
-        -c '{"function":"GetModel","Args":["1"]}' 2>&1)
-    if echo "$RESULT" | python3 -c "import json,sys;d=json.load(sys.stdin);assert d['round']==1" 2>/dev/null; then
+        -c '{"function":"ExportAuditTrail","Args":[]}' 2>&1)
+    if echo "$RESULT" | python3 -c "import json,sys;d=json.load(sys.stdin);assert isinstance(d,list)" 2>/dev/null; then
         log "Smoke test PASSED ✅"
     else
-        warn "Smoke test inconclusive — retry in 10s: peer chaincode query -C mychannel -n trust-registry -c '{\"function\":\"GetModel\",\"Args\":[\"1\"]}'"
+        warn "Smoke test inconclusive — retry in 10s: peer chaincode query -C mychannel -n trust-registry -c '{\"function\":\"ExportAuditTrail\",\"Args\":[]}'"
     fi
     cd "$PROJECT_DIR"
 else
@@ -285,10 +315,11 @@ if command -v go &>/dev/null; then
         chmod -R u+w vendor 2>/dev/null || true
         rm -rf vendor 2>/dev/null || true
     fi
-    export GOPROXY=direct,off
+    # Prefer module download over vendored payloads; this keeps chaincode
+    # install artifacts smaller and avoids Docker socket stress on some hosts.
+    export GOPROXY=https://proxy.golang.org,direct
     export GO111MODULE=on
     go mod download 2>&1 | tail -5 || true
-    go mod vendor 2>&1 | tail -20 || true
     cd "$PROJECT_DIR"
 else
     warn "Go not found — chaincode packaging may fail. Install: https://go.dev/dl/"
@@ -452,23 +483,7 @@ else
 fi
 fi
 
-step "Writing Python connection config"
-cat > "$SCRIPT_DIR/fabric_connection.env" << ENV
-FABRIC_CHANNEL=$CHANNEL_NAME
-FABRIC_CHAINCODE=$CC_NAME
-FABRIC_PEER_ORG1_ENDPOINT=localhost:7051
-FABRIC_PEER_ORG2_ENDPOINT=localhost:9051
-FABRIC_ORG1_MSP_ID=Org1MSP
-FABRIC_ORG2_MSP_ID=Org2MSP
-FABRIC_ORG1_CERT=$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp/signcerts/Admin@org1.example.com-cert.pem
-FABRIC_ORG1_KEY_DIR=$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/users/Admin@org1.example.com/msp/keystore
-FABRIC_ORG1_TLS_CERT=$PROJECT_DIR/organizations/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt
-FABRIC_ORG2_CERT=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/users/Admin@org2.example.com/msp/signcerts/Admin@org2.example.com-cert.pem
-FABRIC_ORG2_KEY_DIR=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/users/Admin@org2.example.com/msp/keystore
-FABRIC_ORG2_TLS_CERT=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt
-FABRIC_ORDERER_TLS_CERT=$PROJECT_DIR/organizations/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem
-ENV
-log "Config written: $SCRIPT_DIR/fabric_connection.env"
+write_connection_config
 
 echo ""
 echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
