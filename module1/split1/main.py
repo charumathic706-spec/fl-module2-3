@@ -23,6 +23,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -41,10 +42,17 @@ if _MODULE_ROOT not in sys.path:
 
 from common.data_partition  import (
     load_dataset, dirichlet_partition, make_synthetic_data,
-    save_partitions, load_partition,
+    load_partition,
+)
+from common.partition_cache import (
+    build_partition_spec,
+    get_partition_cache_paths,
+    load_partition_cache_if_match,
+    save_partition_cache,
 )
 from common.fedavg_strategy import get_fedavg_strategy
 from common.flower_client   import BankFederatedClient
+from common.experiment_tracking import write_run_manifest
 
 SERVER_ADDRESS = "127.0.0.1:8080"
 
@@ -141,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_smote",     action="store_true")
     p.add_argument("--max_samples",  type=int,   default=None)
     p.add_argument("--log_dir",      type=str,   default="logs_split1")
+    p.add_argument("--seed",         type=int,   default=42)
     # Hidden flags for subprocess re-invocation
     p.add_argument("--_client_mode", action="store_true",  help=argparse.SUPPRESS)
     p.add_argument("--_cid",   type=int, default=-1,       help=argparse.SUPPRESS)
@@ -170,6 +179,9 @@ def main() -> None:
     # ── ORCHESTRATOR MODE ─────────────────────────────────────────────────────
     import flwr as fl
 
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
     os.makedirs(args.log_dir, exist_ok=True)
 
     sep = "=" * 62
@@ -188,16 +200,29 @@ def main() -> None:
         X, y = load_dataset(args.data_path)
 
     # Step 2: Partition
-    partitions = dirichlet_partition(
-        X, y,
-        num_clients = args.num_clients,
-        alpha       = args.alpha,
-        max_samples = args.max_samples,
+    cache_path, _ = get_partition_cache_paths(args.log_dir, ".partition_cache.npz")
+    spec = build_partition_spec(
+        X=X,
+        y=y,
+        num_clients=args.num_clients,
+        alpha=args.alpha,
+        max_samples=args.max_samples,
+        seed=args.seed,
     )
+    partitions = load_partition_cache_if_match(cache_path, spec, args.num_clients)
+    if partitions is None:
+        partitions = dirichlet_partition(
+            X, y,
+            num_clients = args.num_clients,
+            alpha       = args.alpha,
+            max_samples = args.max_samples,
+        )
+        save_partition_cache(partitions, cache_path, spec)
+        print(f"[Main] Partition cache rebuilt -> {cache_path}")
+    else:
+        print(f"[Main] Reusing deterministic partition cache -> {cache_path}")
 
-    # Step 3: Write shared partition cache
-    cache_path = os.path.join(args.log_dir, ".partition_cache.npz")
-    save_partitions(partitions, cache_path)
+    # Step 3: Shared partition cache already created/reused above
 
     # Step 4: Build FedAvg strategy
     strategy = get_fedavg_strategy(
@@ -281,6 +306,39 @@ def main() -> None:
     print(f"\n[Main] {'OK' if all_ok else 'WARN'} Split 1 complete.")
     print(f"         Log  -> {log_path}")
     print(f"         Plot -> {os.path.join(args.log_dir, 'split1_training_curves.png')}")
+
+    repo_root = os.path.dirname(_MODULE_ROOT)
+    dataset_meta = {
+        "source": "synthetic" if (args.synthetic or args.data_path is None) else args.data_path,
+        "num_samples": int(len(y)),
+        "num_features": int(X.shape[1]),
+        "fraud_rate": float(np.mean(y)),
+    }
+    run_config = {
+        "strategy": "fedavg",
+        "model": args.model,
+        "num_clients": args.num_clients,
+        "rounds": args.rounds,
+        "alpha": args.alpha,
+        "fraction_fit": args.fraction_fit,
+        "attack": "none",
+        "blockchain": "disabled",
+        "seed": args.seed,
+    }
+    runtime_meta = {
+        "flower_server": SERVER_ADDRESS,
+        "flower_version": str(getattr(fl, "__version__", "unknown")),
+        "backend": "none",
+    }
+    manifest_path = write_run_manifest(
+        repo_root=repo_root,
+        log_dir=args.log_dir,
+        run_config=run_config,
+        dataset_meta=dataset_meta,
+        runtime_meta=runtime_meta,
+        governance_output_dir=None,
+    )
+    print(f"         Manifest -> {manifest_path}")
     print(f"\n  -> Next: run Split 2 (trust-weighted aggregation + attack simulation)")
 
 

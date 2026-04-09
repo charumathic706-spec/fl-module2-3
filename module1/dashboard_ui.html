@@ -241,6 +241,18 @@
     letter-spacing: 0.6px;
   }
   .mono { font-family: 'JetBrains Mono', monospace; word-break: break-all; }
+  .tamper-banner {
+    display: none;
+    margin-top: 10px;
+    margin-bottom: 16px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 59, 48, 0.45);
+    background: rgba(255, 59, 48, 0.12);
+    color: #FFD3CE;
+    font-size: 13px;
+    font-weight: 600;
+  }
 
   /* Waiting Screen */
   .overlay-waiting {
@@ -444,6 +456,7 @@
   </div>
 
   <div class="tab-panel" id="tab-chain">
+    <div class="tamper-banner" id="tamper-banner">Tamper detected: chain integrity check failed or tamper alerts were raised.</div>
     <section class="impl-grid">
       <div class="glass-panel impl-card">
         <div class="section-title" style="margin-top: 0">How Blockchain Is Implemented Here</div>
@@ -490,10 +503,22 @@
       <div class="section-title" style="margin-top: 0">Round Commit Timeline</div>
       <table class="ledger-table" id="impl-commit-table">
         <thead>
-          <tr><th>Round</th><th>Commit Tx</th><th>Audit Tx</th><th>Block Hash</th><th>Flags</th></tr>
+          <tr><th>Round</th><th>Commit Tx</th><th>Audit Tx</th><th>Block Hash</th><th>Verification / Flags</th></tr>
         </thead>
         <tbody id="impl-commit-body">
           <tr><td colspan="5" style="color: var(--text-muted);">Waiting for governance commit data...</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="glass-panel impl-card">
+      <div class="section-title" style="margin-top: 0">Quarantine Timeline</div>
+      <table class="ledger-table">
+        <thead>
+          <tr><th>Round</th><th>Quarantined Clients</th><th>Reason</th></tr>
+        </thead>
+        <tbody id="impl-quarantine-body">
+          <tr><td colspan="3" style="color: var(--text-muted);">No quarantine events yet.</td></tr>
         </tbody>
       </table>
     </section>
@@ -505,7 +530,9 @@
           <tr><th>Field</th><th>Value</th></tr>
         </thead>
         <tbody>
-          <tr><td>Data Protection Mode</td><td class="mono" id="sec-protection">n/a</td></tr>
+          <tr><td>Signing Mode</td><td class="mono" id="sec-protection">n/a</td></tr>
+          <tr><td>Round Event Verification</td><td class="mono" id="sec-event-verify">n/a</td></tr>
+          <tr><td>Attestation Verification</td><td class="mono" id="sec-attest-verify">n/a</td></tr>
           <tr><td>Attestation Algorithm</td><td class="mono" id="sec-attest-algo">n/a</td></tr>
           <tr><td>Attestation Key ID</td><td class="mono" id="sec-attest-key">n/a</td></tr>
           <tr><td>Attestation Signature</td><td class="mono" id="sec-attest-sig">n/a</td></tr>
@@ -515,7 +542,7 @@
           <tr><td>Round Event Sequence</td><td class="mono" id="sec-event-seq">n/a</td></tr>
           <tr><td>Round Event Hash</td><td class="mono" id="sec-event-hash">n/a</td></tr>
           <tr><td>Round Event Prev Hash</td><td class="mono" id="sec-event-prev-hash">n/a</td></tr>
-          <tr><td>Round Event Verify Reason</td><td class="mono" id="sec-event-reason">n/a</td></tr>
+          <tr><td>Round Event Verification Reason</td><td class="mono" id="sec-event-reason">n/a</td></tr>
           <tr><td>Event Signature</td><td class="mono" id="sec-event-sig">n/a</td></tr>
           <tr><td>Policy Violations</td><td class="mono" id="sec-policy-violations">none</td></tr>
           <tr><td>Quarantined Clients</td><td class="mono" id="sec-quarantine">none</td></tr>
@@ -548,7 +575,7 @@
           <tr><td>Fraud Recall</td><td class="mono" id="qual-fraud-recall">0.0000</td></tr>
           <tr><td>Balanced Accuracy</td><td class="mono" id="qual-balanced-accuracy">0.0000</td></tr>
           <tr><td>MCC</td><td class="mono" id="qual-mcc">0.0000</td></tr>
-          <tr><td>False Positive Flags</td><td class="mono" id="qual-false-positives">0</td></tr>
+          <tr><td>False Positive Detections</td><td class="mono" id="qual-false-positives">0</td></tr>
         </tbody>
       </table>
     </section>
@@ -765,6 +792,18 @@ function updateBlockchainSummary(state) {
   const protectionLabel = state.attestation_algo
     ? `SIGNED (${state.attestation_algo})`
     : 'SIGNED (algorithm unavailable)';
+  const eventVerifyLabel = state.round_event_verified === undefined
+    ? 'n/a'
+    : (state.round_event_verified ? 'VERIFIED' : 'REJECTED');
+  const attestVerifyLabel = state.attestation_verified === undefined
+    ? 'n/a'
+    : (state.attestation_verified ? 'VERIFIED' : 'FAILED');
+
+  function formatDiagnosticTimestamp(rawTs) {
+    const ts = Number(rawTs);
+    if (!Number.isFinite(ts) || ts <= 0) return 'n/a';
+    return `${new Date(ts * 1000).toLocaleString()} (${ts.toFixed(3)})`;
+  }
 
   document.getElementById('bc-backend').textContent = backend;
   document.getElementById('bc-chain').textContent = chainLabel;
@@ -793,11 +832,13 @@ function updateBlockchainSummary(state) {
   document.getElementById('impl-gov-source').textContent = bc.source || 'n/a';
   document.getElementById('impl-log-path').textContent = (state.log_status || {}).path || 'n/a';
   document.getElementById('impl-input-log').textContent = (state.log_status || {}).input_path || 'n/a';
-  document.getElementById('impl-log-exists').textContent = String(Boolean((state.log_status || {}).exists));
-  document.getElementById('impl-last-refresh').textContent = String((state.log_status || {}).last_refresh_ts || 'n/a');
-  document.getElementById('impl-last-success').textContent = String((state.log_status || {}).last_success_ts || 'n/a');
+  document.getElementById('impl-log-exists').textContent = Boolean((state.log_status || {}).exists) ? 'YES' : 'NO';
+  document.getElementById('impl-last-refresh').textContent = formatDiagnosticTimestamp((state.log_status || {}).last_refresh_ts);
+  document.getElementById('impl-last-success').textContent = formatDiagnosticTimestamp((state.log_status || {}).last_success_ts);
 
   document.getElementById('sec-protection').textContent = protectionLabel;
+  document.getElementById('sec-event-verify').textContent = eventVerifyLabel;
+  document.getElementById('sec-attest-verify').textContent = attestVerifyLabel;
   document.getElementById('sec-attest-algo').textContent = state.attestation_algo || 'n/a';
   document.getElementById('sec-attest-key').textContent = state.attestation_key_id || 'n/a';
   document.getElementById('sec-attest-sig').textContent = state.attestation_signature || 'n/a';
@@ -818,6 +859,13 @@ function updateBlockchainSummary(state) {
   document.getElementById('sec-hash-entries').textContent = String(Number(bc.hash_chain_entries || 0));
   document.getElementById('sec-backend-evidence').textContent = bc.backend_reason || 'n/a';
 
+  const tamperBanner = document.getElementById('tamper-banner');
+  const tamperDetected = Boolean(state.tamper_detected);
+  tamperBanner.style.display = tamperDetected ? 'block' : 'none';
+  if (tamperDetected) {
+    tamperBanner.textContent = `Tamper detected: chain integrity=${chainLabel}, alerts=${Number(state.tamper_events || 0)}`;
+  }
+
   document.getElementById('qual-pr-auc').textContent = Number(state.global_pr_auc || 0).toFixed(4);
   document.getElementById('qual-best-pr-auc').textContent = Number(state.best_pr_auc || 0).toFixed(4);
   document.getElementById('qual-best-f1').textContent = Number(state.best_f1 || 0).toFixed(4);
@@ -833,9 +881,11 @@ function updateBlockchainSummary(state) {
   document.getElementById('impl-parse-errors').textContent = String(logStatus.parse_errors || 0);
 
   const body = document.getElementById('impl-commit-body');
+  const quarantineBody = document.getElementById('impl-quarantine-body');
   const commits = Array.isArray(bc.recent_commits) ? bc.recent_commits : [];
   if (!commits.length) {
     body.innerHTML = '<tr><td colspan="5" style="color: var(--text-muted);">No commit data yet. Run Split 2 with blockchain enabled and governance output will appear here.</td></tr>';
+    quarantineBody.innerHTML = '<tr><td colspan="3" style="color: var(--text-muted);">No quarantine events yet.</td></tr>';
     return;
   }
 
@@ -854,6 +904,27 @@ function updateBlockchainSummary(state) {
       </tr>`;
     })
     .join('');
+
+  const quarantineRows = commits
+    .slice()
+    .filter((rec) => Array.isArray(rec.quarantined_clients) && rec.quarantined_clients.length > 0)
+    .sort((a, b) => (b.round || 0) - (a.round || 0))
+    .map((rec) => {
+      const reasons = Array.isArray(rec.policy_violations) && rec.policy_violations.length
+        ? rec.policy_violations.join(' | ')
+        : 'governance quarantine rule triggered';
+      return `<tr>
+        <td>${rec.round || 0}</td>
+        <td class="mono">${rec.quarantined_clients.join(', ')}</td>
+        <td>${reasons}</td>
+      </tr>`;
+    });
+
+  if (quarantineRows.length > 0) {
+    quarantineBody.innerHTML = quarantineRows.join('');
+  } else {
+    quarantineBody.innerHTML = '<tr><td colspan="3" style="color: var(--text-muted);">No quarantine events yet.</td></tr>';
+  }
 }
 
 function applyState(state) {

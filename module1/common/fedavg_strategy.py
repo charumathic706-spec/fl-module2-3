@@ -180,14 +180,16 @@ class InstrumentedFedAvg(FedAvg):
         if metrics_agg:
             gf1  = float(metrics_agg.get("f1",        0))
             gauc = float(metrics_agg.get("auc_roc",   0))
+            gpra = float(metrics_agg.get("pr_auc",    0))
             grec = float(metrics_agg.get("recall",    0))
             gpre = float(metrics_agg.get("precision", 0))
             gacc = float(metrics_agg.get("accuracy",  0))
+            gthr = float(metrics_agg.get("decision_threshold", 0.5))
 
             print(
                 f"\n  [Global eval] "
                 f"F1={gf1:.4f} | AUC={gauc:.4f} | "
-                f"Recall={grec:.4f} | Precision={gpre:.4f} | Accuracy={gacc:.4f}"
+                f"PR-AUC={gpra:.4f} | Recall={grec:.4f} | Precision={gpre:.4f} | Accuracy={gacc:.4f}"
             )
 
             if gf1 > self.best_f1:
@@ -199,8 +201,10 @@ class InstrumentedFedAvg(FedAvg):
                 "round":            server_round,
                 "global_f1":        gf1,
                 "global_auc":       gauc,
+                "global_pr_auc":    gpra,
                 "global_recall":    grec,
                 "global_precision": gpre,
+                "global_decision_threshold": gthr,
                 "global_accuracy":  gacc,
                 "global_loss":      float(loss_agg) if loss_agg is not None else 0.0,
                 "best_f1":          self.best_f1,

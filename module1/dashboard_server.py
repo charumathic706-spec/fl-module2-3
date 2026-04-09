@@ -29,6 +29,7 @@
 import argparse
 import http.server
 import json
+import re
 import os
 import sys
 import threading
@@ -99,6 +100,56 @@ class LogWatcher:
       if not rounds:
         return {
           "status": "waiting",
+          "current_round": 0,
+          "total_rounds": self.expected_rounds if self.expected_rounds else 0,
+          "global_f1": 0.0,
+          "global_auc": 0.0,
+          "global_pr_auc": 0.0,
+          "global_decision_threshold": 0.0,
+          "global_fraud_precision": 0.0,
+          "global_fraud_recall": 0.0,
+          "global_balanced_accuracy": 0.0,
+          "global_mcc": 0.0,
+          "best_f1": 0.0,
+          "best_auc": 0.0,
+          "best_pr_auc": 0.0,
+          "flagged": [],
+          "trusted": [],
+          "attacker": None,
+          "detected_rounds": 0,
+          "false_positives": 0,
+          "client_ids": [],
+          "trust_latest": {},
+          "alpha_latest": {},
+          "round_nums": [],
+          "f1_history": [],
+          "auc_history": [],
+          "pr_auc_history": [],
+          "threshold_history": [],
+          "trust_history": {},
+          "alpha_history": {},
+          "model_hash": "",
+          "blockchain_round": 0,
+          "chain_round": 0,
+          "blockchain_tx_id": "",
+          "audit_tx_id": "",
+          "round_event_verified": False,
+          "round_event_reason": "",
+          "attestation_verified": False,
+          "attestation_key_id": "",
+          "attestation_algo": "",
+          "attestation_signature": "",
+          "round_event_hash": "",
+          "round_event_prev_hash": "",
+          "round_event_signature": "",
+          "round_event_key_id": "",
+          "round_event_algo": "",
+          "round_event_run_id": "",
+          "round_event_sequence": 0,
+          "policy_violations": [],
+          "quarantined_clients": [],
+          "tamper_detected": False,
+          "tamper_events": 0,
           "rounds": [],
           "latest": None,
           "blockchain": self._build_blockchain_state(),
@@ -108,6 +159,8 @@ class LogWatcher:
       latest = rounds[-1]
       best_f1 = max((r.get("global_f1", 0) for r in rounds), default=0)
       best_auc = max((r.get("global_auc", 0) for r in rounds), default=0)
+      best_pr_auc = max((r.get("global_pr_auc", 0) for r in rounds), default=0)
+      latest_event = latest.get("round_event", {}) or {}
 
       client_ids_set = set()
       for r in rounds:
@@ -135,12 +188,16 @@ class LogWatcher:
       alpha_history = {str(i): [] for i in client_ids}
       f1_history = []
       auc_history = []
+      pr_auc_history = []
+      threshold_history = []
       round_nums = []
 
       for r in rounds:
         round_nums.append(r.get("round", 0))
         f1_history.append(round(r.get("global_f1", 0), 4))
         auc_history.append(round(r.get("global_auc", 0), 4))
+        pr_auc_history.append(round(r.get("global_pr_auc", 0), 4))
+        threshold_history.append(round(r.get("global_decision_threshold", 0), 6))
         ts = r.get("trust_scores", {})
         as_ = r.get("anomaly_scores", {})
         for i in client_ids:
@@ -164,6 +221,19 @@ class LogWatcher:
       total_rounds = self.expected_rounds if self.expected_rounds else inferred_total
       status = "complete" if (self.expected_rounds and current_round >= self.expected_rounds) else "running"
       blockchain_state = self._build_blockchain_state()
+      latest_record = blockchain_state.get("latest_record", {}) if isinstance(blockchain_state, dict) else {}
+
+      round_event_verified = bool(latest_record.get("round_event_verified", latest.get("round_event_verified", False)))
+      round_event_reason = str(latest_record.get("round_event_reason", latest.get("round_event_reason", "")))
+      attestation_verified = bool(latest_record.get("attestation_verified", latest.get("attestation_verified", False)))
+      attestation_key_id = str(latest_record.get("attestation_key_id", latest.get("attestation_key_id", "")))
+      attestation_algo = str(latest_record.get("attestation_algo", latest.get("attestation_algo", "")))
+      attestation_signature = str(latest_record.get("attestation_signature", latest.get("attestation_signature", "")))
+      chain_round = int(latest_record.get("chain_round", latest.get("chain_round", latest.get("round", 0)) or 0))
+      policy_violations = latest_record.get("policy_violations", []) or []
+      quarantined_clients = latest_record.get("quarantined_clients", latest.get("quarantined_clients", []) or [])
+
+      latest_event_payload = latest_event.get("payload", {}) if isinstance(latest_event, dict) else {}
 
       return {
         "status": status,
@@ -171,8 +241,15 @@ class LogWatcher:
         "total_rounds": total_rounds,
         "global_f1": round(latest.get("global_f1", 0), 4),
         "global_auc": round(latest.get("global_auc", 0), 4),
+        "global_pr_auc": round(latest.get("global_pr_auc", 0), 4),
+        "global_decision_threshold": round(latest.get("global_decision_threshold", 0), 6),
+        "global_fraud_precision": round(latest.get("global_fraud_precision", latest.get("global_precision", 0)), 4),
+        "global_fraud_recall": round(latest.get("global_fraud_recall", latest.get("global_recall", 0)), 4),
+        "global_balanced_accuracy": round(latest.get("global_balanced_accuracy", 0), 4),
+        "global_mcc": round(latest.get("global_mcc", 0), 4),
         "best_f1": round(best_f1, 4),
         "best_auc": round(best_auc, 4),
+        "best_pr_auc": round(best_pr_auc, 4),
         "flagged": flagged,
         "trusted": trusted,
         "attacker": attacker,
@@ -194,10 +271,32 @@ class LogWatcher:
         "round_nums": round_nums,
         "f1_history": f1_history,
         "auc_history": auc_history,
+        "pr_auc_history": pr_auc_history,
+        "threshold_history": threshold_history,
         "trust_history": trust_history,
         "alpha_history": alpha_history,
         "model_hash": latest.get("model_hash", ""),
         "blockchain_round": latest.get("round", 0),
+        "chain_round": chain_round,
+        "blockchain_tx_id": str(latest_record.get("blockchain_tx_id", latest.get("blockchain_tx_id", ""))),
+        "audit_tx_id": str(latest_record.get("audit_tx_id", latest.get("audit_tx_id", ""))),
+        "round_event_verified": round_event_verified,
+        "round_event_reason": round_event_reason,
+        "attestation_verified": attestation_verified,
+        "attestation_key_id": attestation_key_id,
+        "attestation_algo": attestation_algo,
+        "attestation_signature": attestation_signature,
+        "round_event_hash": str(latest_event.get("event_hash", "")),
+        "round_event_prev_hash": str(latest_event.get("prev_event_hash", "")),
+        "round_event_signature": str(latest_event.get("signature", "")),
+        "round_event_key_id": str(latest_event.get("key_id", "")),
+        "round_event_algo": str(latest_event.get("signing_algo", "")),
+        "round_event_run_id": str(latest_event_payload.get("run_id", "")),
+        "round_event_sequence": int(latest_event_payload.get("event_sequence", 0) or 0),
+        "policy_violations": policy_violations,
+        "quarantined_clients": quarantined_clients,
+        "tamper_detected": bool(blockchain_state.get("chain_intact") is False or int(blockchain_state.get("tamper_events", 0) or 0) > 0),
+        "tamper_events": int(blockchain_state.get("tamper_events", 0) or 0),
         "blockchain": blockchain_state,
         "log_status": self._build_log_status(),
       }
@@ -233,6 +332,7 @@ class LogWatcher:
         """Build blockchain telemetry from governance artifacts, if available."""
         state = {
             "backend": "unknown",
+        "backend_reason": "No governance artifacts found",
             "chain_intact": None,
             "tamper_events": 0,
             "committed_rounds": 0,
@@ -243,6 +343,11 @@ class LogWatcher:
             "latest_audit_tx": "",
             "latest_block_hash": "",
             "recent_commits": [],
+            "latest_record": {},
+            "fabric_channel": "",
+            "fabric_chaincode": "",
+            "fabric_peer_org1": "",
+            "fabric_peer_org2": "",
             "source": "none",
         }
 
@@ -263,8 +368,15 @@ class LogWatcher:
             state["tamper_events"] = int(summary.get("tamper_events", 0) or 0)
             state["committed_rounds"] = len(records)
 
+            backend_used = str(summary.get("backend_used", "")).strip().lower()
+            if backend_used:
+                state["backend"] = backend_used
+                backend_source = str(summary.get("backend_source", "governance_report"))
+                state["backend_reason"] = f"Authoritative report backend: {backend_source}"
+
             if records:
                 last = records[-1]
+                state["latest_record"] = dict(last)
                 state["latest_commit_tx"] = str(last.get("blockchain_tx_id", ""))
                 state["latest_audit_tx"] = str(last.get("audit_tx_id", ""))
                 state["latest_block_hash"] = str(last.get("block_hash", ""))
@@ -279,15 +391,26 @@ class LogWatcher:
                     "block_hash": str(rec.get("block_hash", "")),
                     "flagged_count": len(rec.get("flagged_clients", []) or []),
                     "trusted_count": len(rec.get("trusted_clients", []) or []),
+                    "chain_round": int(rec.get("chain_round", rec.get("round", 0)) or 0),
+                    "round_event_verified": bool(rec.get("round_event_verified", False)),
+                    "round_event_reason": str(rec.get("round_event_reason", "")),
+                    "attestation_verified": bool(rec.get("attestation_verified", False)),
+                    "attestation_key_id": str(rec.get("attestation_key_id", "")),
+                    "attestation_algo": str(rec.get("attestation_algo", "")),
+                    "policy_violations": rec.get("policy_violations", []) or [],
+                    "quarantined_clients": rec.get("quarantined_clients", []) or [],
                 })
             state["recent_commits"] = recent
 
             if records:
                 first_tx = str(records[0].get("blockchain_tx_id", ""))
-                if first_tx.startswith("SIM_TX"):
-                    state["backend"] = "simulation"
-                else:
-                    state["backend"] = "fabric"
+                inferred = self._infer_backend_from_tx(first_tx)
+                if inferred and state["backend"] == "unknown":
+                    state["backend"] = inferred
+                    state["backend_reason"] = f"Detected from tx format: {first_tx[:18]}..."
+                elif not inferred and state["backend"] == "unknown":
+                    state["backend"] = "unknown"
+                    state["backend_reason"] = "Could not infer backend from transaction id format"
 
         hash_chain = self._safe_json(hash_chain_path)
         if isinstance(hash_chain, list):
@@ -295,11 +418,62 @@ class LogWatcher:
 
         deployment = self._safe_json(deployment_path)
         if isinstance(deployment, dict):
-            state["backend"] = "ganache"
             state["contract_address"] = str(deployment.get("address", ""))
             state["deploy_tx"] = str(deployment.get("deploy_tx", ""))
+            if state["backend"] == "unknown":
+                state["backend"] = "ganache"
+                state["backend_reason"] = "eth_deployment.json present (fallback inference)"
+            elif state["backend"] != "ganache":
+                state["backend_reason"] += "; eth_deployment.json also present"
+
+        if state["backend"] == "fabric":
+            fabric_meta = self._read_fabric_env()
+            if fabric_meta:
+                state["fabric_channel"] = fabric_meta.get("FABRIC_CHANNEL", "")
+                state["fabric_chaincode"] = fabric_meta.get("FABRIC_CHAINCODE", "")
+                state["fabric_peer_org1"] = fabric_meta.get("FABRIC_PEER_ORG1_ENDPOINT", "")
+                state["fabric_peer_org2"] = fabric_meta.get("FABRIC_PEER_ORG2_ENDPOINT", "")
 
         return state
+
+    def _read_fabric_env(self) -> dict:
+        candidates = [
+            os.path.join(os.getcwd(), "module1", "split3", "hlf_enterprise", "fabric_connection.env"),
+            os.path.join(os.getcwd(), "module1", "split3", "hlf", "fabric_connection.env"),
+            os.getenv("BATFL_FABRIC_ENV_FILE", ""),
+        ]
+        for path in candidates:
+            if not path:
+                continue
+            norm = os.path.abspath(path)
+            if not os.path.exists(norm):
+                continue
+            result: dict[str, str] = {}
+            try:
+                with open(norm, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        result[key.strip()] = value.strip()
+            except OSError:
+                return {}
+            return result
+        return {}
+
+    @staticmethod
+    def _infer_backend_from_tx(tx_id: str) -> str | None:
+        tx = (tx_id or "").strip()
+        if not tx:
+            return None
+        if tx.startswith("SIM_TX"):
+            return "simulation"
+        if re.fullmatch(r"0x[0-9a-fA-F]{64}", tx):
+            return "ganache"
+        if re.fullmatch(r"[0-9a-fA-F]{32}", tx):
+            return "fabric"
+        return None
 
     def _find_governance_dir(self):
         base_from_log = os.path.dirname(os.path.abspath(self.log_path))
@@ -589,7 +763,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     
     <div class="glass-panel blockchain-container">
-      <div class="section-title" style="margin-top: 0">Blockchain Immutable Ledger</div>
+      <div class="section-title" style="margin-top: 0">Blockchain Immutable Ledger <span id="backend-chip" style="font-size:11px;color:var(--text-muted)">backend: unknown</span></div>
+      <div id="backend-reason" style="font-size:11px;color:var(--text-muted);margin-bottom:10px;">detection: waiting for governance artifacts</div>
       <div class="terminal" id="terminal-log">
         <div style="color: #6272A4; margin-bottom: 10px;">> Connection to Smart Contract established...</div>
         <div style="color: #6272A4; margin-bottom: 10px;">> Awaiting commits...</div>
@@ -733,6 +908,11 @@ function applyState(state) {
   document.getElementById('m-f1').textContent = state.global_f1.toFixed(3);
   document.getElementById('m-auc').textContent = state.global_auc.toFixed(3);
   document.getElementById('m-det').textContent = state.detected_rounds + ' / ' + state.current_round;
+
+  const backend = ((state.blockchain || {}).backend || 'unknown').toUpperCase();
+  const backendReason = ((state.blockchain || {}).backend_reason || 'no backend evidence yet');
+  document.getElementById('backend-chip').textContent = 'backend: ' + backend;
+  document.getElementById('backend-reason').textContent = 'detection: ' + backendReason;
 
   renderClientCards(state);
   

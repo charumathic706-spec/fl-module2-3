@@ -42,6 +42,8 @@ try:
         ROUND_EVENT_GENESIS,
         create_signed_round_event,
     )
+    from module1.common.event_schema import EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, RoundEventRecord
+    from module1.common.event_storage import create_event_storage
 except ImportError:
     from common.trust_scoring import TrustScorer, AggregationResult
     from common.fedavg_strategy import weighted_average  # reuse metric aggregation from Split 1
@@ -50,6 +52,8 @@ except ImportError:
         ROUND_EVENT_GENESIS,
         create_signed_round_event,
     )
+    from common.event_schema import EVENT_SCHEMA_NAME, EVENT_SCHEMA_VERSION, RoundEventRecord
+    from common.event_storage import create_event_storage
 
 
 # ??????????????????????????????????????????????????????????????????????????
@@ -88,6 +92,7 @@ class TrustWeightedFedAvg(Strategy):
         # Attack simulator (injected from main.py for simulation)
         attack_simulator    = None,
         governance_engine   = None,
+        event_storage_backend: str = "jsonl",
     ):
         self.num_clients       = num_clients
         self.fraction_fit      = fraction_fit
@@ -113,6 +118,8 @@ class TrustWeightedFedAvg(Strategy):
         self.round_logs:  List[Dict] = []
         self._pending_round_logs: Dict[int, Dict] = {}
         self.round_event_log_path = os.path.join(log_dir, "round_events.jsonl")
+        self.event_storage_backend = event_storage_backend
+        self.event_storage = create_event_storage(event_storage_backend, log_dir)
         self._last_round_event_hash: str = ROUND_EVENT_GENESIS
         self._round_event_run_id: str = os.getenv("BATFL_RUN_ID", f"run-{uuid.uuid4().hex[:12]}")
         self._round_event_sequence: int = 0
@@ -364,13 +371,25 @@ class TrustWeightedFedAvg(Strategy):
                     round_log.update({
                         "blockchain_tx_id": gov_record.blockchain_tx_id,
                         "audit_tx_id": gov_record.audit_tx_id,
+                        "quarantined_clients": gov_record.quarantined_clients,
+                        "round_event_verified": gov_record.round_event_verified,
+                        "round_event_reason": gov_record.round_event_reason,
+                        "attestation_verified": gov_record.attestation_verified,
+                        "attestation_key_id": gov_record.attestation_key_id,
+                        "attestation_algo": gov_record.attestation_algo,
+                        "attestation_signature": gov_record.attestation_signature,
+                        "policy_violations": gov_record.policy_violations,
                     })
                 except Exception as _ge:
                     raise RuntimeError(
                         f"[Module 2] Governance failure at round {server_round}: {_ge}"
                     ) from _ge
+            else:
+                round_log.setdefault("blockchain_tx_id", "")
+                round_log.setdefault("audit_tx_id", "")
 
             self.round_logs.append(round_log)
+            self.event_storage.append_round_event(round_log)
             self._pending_round_logs.pop(server_round, None)
             self._flush_logs()
         else:
@@ -419,11 +438,14 @@ class TrustWeightedFedAvg(Strategy):
         """Build per-round metadata to be finalized after evaluation metrics arrive."""
         trust_summary = self.trust_scorer.get_trust_summary()
         log = {
+            "schema_name":     EVENT_SCHEMA_NAME,
+            "schema_version":  EVENT_SCHEMA_VERSION,
             "round":           round_num,
             "timestamp":       datetime.now(timezone.utc).isoformat(),
             "model_hash":      model_hash,
             "trusted_clients": result.trusted_clients,
             "flagged_clients": result.flagged_clients,
+            "quarantined_clients": [],
             "trust_weights":   {str(k): v for k, v in result.trust_weights.items()},
             "anomaly_scores":  {str(k): v for k, v in result.anomaly_scores.items()},
             "cos_similarities": {str(k): v for k, v in result.cos_similarities.items()},
@@ -447,6 +469,10 @@ class TrustWeightedFedAvg(Strategy):
         with open(self.round_event_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, sort_keys=True))
             f.write("\n")
+
+    def validate_round_logs(self) -> None:
+        for rec in self.round_logs:
+            RoundEventRecord.from_payload(rec)
 
     def print_summary(self) -> None:
         """Final summary after all rounds — shows all evaluation metrics."""
@@ -502,6 +528,7 @@ def get_trust_strategy(
     log_dir:            str   = "logs_split2",
     attack_simulator          = None,
     governance_engine         = None,   # MODULE 2: pass GovernanceEngine here
+    event_storage_backend: str = "jsonl",
     # TrustScorer hyperparameters (all have sensible defaults in TrustWeightedFedAvg)
     lambda_cosine:      float = 0.5,
     lambda_distance:    float = 0.3,
@@ -554,4 +581,5 @@ def get_trust_strategy(
         log_dir           = log_dir,
         attack_simulator  = attack_simulator,
         governance_engine = governance_engine,
+        event_storage_backend = event_storage_backend,
     )

@@ -1,0 +1,14 @@
+{
+  "version": "batfl.governance-policy.v1",
+  "quarantine": {
+    "consecutive_flag_limit": 3,
+    "on_policy_violation": "quarantine_flagged"
+  },
+  "round_requirements": {
+    "min_global_f1": 0.6,
+    "min_global_auc": 0.7,
+    "max_false_positive_rate": 0.25,
+    "max_auc_drift": 0.08,
+    "min_required_clients": 3
+  }
+}

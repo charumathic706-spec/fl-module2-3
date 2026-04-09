@@ -21,10 +21,12 @@ import argparse
 import json
 import multiprocessing
 import os
+import random
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from typing import List
 
 import numpy as np
@@ -42,27 +44,147 @@ try:
         load_dataset,
         dirichlet_partition,
         make_synthetic_data,
-        save_partitions,
         load_partition,
+    )
+    from module1.common.partition_cache import (
+        build_partition_spec,
+        get_partition_cache_paths,
+        load_partition_cache_if_match,
+        save_partition_cache,
     )
     from module1.common.trust_weighted_strategy import get_trust_strategy
     from module1.common.attack_simulator import AttackSimulator
     from module1.common.flower_client import BankFederatedClient
     from module1.common.governance_bridge import build_governance_engine
+    from module1.common.experiment_tracking import write_run_manifest, write_baseline_comparison_report, summarize_run
 except ImportError:
     from common.data_partition import (
         load_dataset,
         dirichlet_partition,
         make_synthetic_data,
-        save_partitions,
         load_partition,
+    )
+    from common.partition_cache import (
+        build_partition_spec,
+        get_partition_cache_paths,
+        load_partition_cache_if_match,
+        save_partition_cache,
     )
     from common.trust_weighted_strategy import get_trust_strategy
     from common.attack_simulator import AttackSimulator
     from common.flower_client import BankFederatedClient
     from common.governance_bridge import build_governance_engine
+    from common.experiment_tracking import write_run_manifest, write_baseline_comparison_report, summarize_run
 
 SERVER_ADDRESS = "127.0.0.1:8081"
+
+
+def _to_bool_env(value: str, default: bool) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _to_wsl_path(path_text: str) -> str:
+    normalized = os.path.abspath(path_text).replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        drive = normalized[0].lower()
+        rest = normalized[2:]
+        if rest.startswith("/"):
+            rest = rest[1:]
+        return f"/mnt/{drive}/{rest}"
+    return normalized
+
+
+def _ensure_fabric_ready() -> None:
+    """Preflight Fabric for direct Split 2 runs on Windows/WSL.
+
+    Controlled by env vars:
+      BATFL_SKIP_FABRIC_PREFLIGHT=true  -> skip all checks
+      BATFL_AUTO_FABRIC_SETUP=false     -> do not auto-run enterprise setup on failed preflight
+      BATFL_ENTERPRISE_CONSENSUS=bft|raft
+    """
+    if _to_bool_env(os.getenv("BATFL_SKIP_FABRIC_PREFLIGHT"), False):
+        print("[Main] BATFL_SKIP_FABRIC_PREFLIGHT=true -> skipping Fabric preflight.")
+        return
+
+    repo_root = os.path.dirname(_MODULE_ROOT)
+    enterprise_dir = os.path.join(repo_root, "module1", "split3", "hlf_enterprise")
+    env_file = os.path.join(enterprise_dir, "fabric_connection.env")
+    health_sh = os.path.join(enterprise_dir, "health_check.sh")
+    setup_sh = os.path.join(enterprise_dir, "setup.sh")
+    consensus_env = os.getenv("BATFL_ENTERPRISE_CONSENSUS", "auto").strip().lower()
+
+    def _detect_consensus_mode() -> str:
+        if consensus_env in {"raft", "bft"}:
+            return consensus_env
+        try:
+            probe = subprocess.run(
+                ["docker", "ps", "--format", "{{.Names}}"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            names = set((probe.stdout or "").splitlines())
+            # BFT profile has additional orderers (orderer2/3/4).
+            if "orderer2.example.com" in names or "orderer3.example.com" in names or "orderer4.example.com" in names:
+                return "bft"
+        except Exception:
+            pass
+        return "raft"
+
+    consensus = _detect_consensus_mode()
+    fallback_consensus = "raft" if consensus == "bft" else "bft"
+
+    if not os.path.exists(health_sh) or not os.path.exists(setup_sh):
+        raise RuntimeError(
+            "Fabric enterprise scripts not found. Expected under module1/split3/hlf_enterprise/."
+        )
+
+    if os.path.exists(env_file):
+        os.environ["BATFL_FABRIC_ENV_FILE"] = env_file
+
+    wsl_health = _to_wsl_path(health_sh)
+
+    def _run_health_check(mode: str) -> bool:
+        health_cmd = f"chmod +x '{wsl_health}' ; '{wsl_health}' '{mode}'"
+        print(f"[Main] Running Fabric preflight health check ({mode.upper()})...", flush=True)
+        try:
+            subprocess.run(["wsl", "bash", "-lc", health_cmd], check=True)
+            os.environ["BATFL_ENTERPRISE_CONSENSUS"] = mode
+            print(f"[Main] Fabric preflight passed ({mode.upper()}).", flush=True)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    if _run_health_check(consensus) or _run_health_check(fallback_consensus):
+        return
+
+    if not _to_bool_env(os.getenv("BATFL_AUTO_FABRIC_SETUP"), True):
+        raise RuntimeError(
+            "Fabric preflight failed and BATFL_AUTO_FABRIC_SETUP=false. "
+            "Run module1/split3/hlf_enterprise/setup.sh, then retry."
+        )
+
+    wsl_setup = _to_wsl_path(setup_sh)
+    setup_cmd = (
+        f"export BATFL_ENTERPRISE_CONSENSUS='{consensus}' ; "
+        f"chmod +x '{wsl_setup}' ; '{wsl_setup}'"
+    )
+
+    print(f"[Main] Fabric preflight failed, running enterprise setup ({consensus.upper()})...", flush=True)
+    subprocess.run(["wsl", "bash", "-lc", setup_cmd], check=True)
+
+    if os.path.exists(env_file):
+        os.environ["BATFL_FABRIC_ENV_FILE"] = env_file
+
+    if _run_health_check(consensus) or _run_health_check(fallback_consensus):
+        print("[Main] Fabric setup + preflight completed.", flush=True)
+        return
+
+    raise RuntimeError(
+        "Fabric setup completed but health check still failed for both RAFT and BFT modes."
+    )
 
 
 # =============================================================================
@@ -156,7 +278,10 @@ def plot_training_curves(log_path: str, save_dir: str) -> None:
 # =============================================================================
 
 def _run_as_client(cid, cache, model_type, use_smote, server_address,
-                   label_flip_clients=None, flip_fraction=1.0, attack_start_round=1):
+                   label_flip_clients=None, flip_fraction=1.0, attack_start_round=1,
+                   attack_end_round=None, attack_type="none", attack_intensity=1.0,
+                   trigger_feature_count=3, trigger_value=5.0, backdoor_target_label=1,
+                   threshold_mode="auto", decision_threshold=0.5, threshold_beta=1.5):
     import flwr as fl
 
     partition = load_partition(cache, cid)
@@ -171,6 +296,15 @@ def _run_as_client(cid, cache, model_type, use_smote, server_address,
         is_label_flip      = cid in set(label_flip_clients or []),
         flip_fraction      = flip_fraction,
         attack_start_round = attack_start_round,
+        attack_end_round   = attack_end_round,
+        attack_type        = attack_type,
+        attack_intensity   = attack_intensity,
+        trigger_feature_count = trigger_feature_count,
+        trigger_value      = trigger_value,
+        backdoor_target_label = backdoor_target_label,
+        threshold_mode     = threshold_mode,
+        decision_threshold = decision_threshold,
+        threshold_beta     = threshold_beta,
     )
 
     max_attempts = 90
@@ -214,11 +348,36 @@ def build_parser():
 
     # Attack
     p.add_argument("--attack",       type=str,   default="none",
-                   choices=["none", "label_flip", "gradient_scale", "combined"])
+                   choices=["none", "label_flip", "gradient_scale", "combined", "backdoor", "sign_flip", "model_replacement", "sybil"])
     p.add_argument("--malicious",    type=int,   nargs="+", default=[1])
     p.add_argument("--gs_clients",   type=int,   nargs="+", default=None)
     p.add_argument("--scale_factor", type=float, default=5.0)
     p.add_argument("--attack_start", type=int,   default=1)
+    p.add_argument("--attack_end",   type=int,   default=None,
+                   help="Optional attack stop round (inclusive)")
+    p.add_argument("--attack_intensity", type=float, default=1.0,
+                   help="Attack intensity multiplier")
+    p.add_argument("--trigger_feature_count", type=int, default=3,
+                   help="Backdoor trigger feature count")
+    p.add_argument("--trigger_value", type=float, default=5.0,
+                   help="Backdoor trigger value")
+    p.add_argument("--backdoor_target_label", type=int, default=1,
+                   help="Backdoor target class label")
+
+    # Evaluation / threshold tuning
+    p.add_argument("--threshold_mode", type=str, default="auto", choices=["auto", "fixed"],
+                   help="Decision-threshold mode for fraud prediction")
+    p.add_argument("--decision_threshold", type=float, default=0.5,
+                   help="Fixed threshold when --threshold_mode=fixed")
+    p.add_argument("--threshold_beta", type=float, default=1.5,
+                   help="F-beta weight used in auto threshold tuning")
+
+    # Experiment tracking
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--comparison_report", action="store_true",
+                   help="Generate baseline comparison report from available runs")
+    p.add_argument("--comparison_dirs", nargs="+", default=["logs_split1", "logs_split2"],
+                   help="Run directories used for comparison report")
 
     # Blockchain (Module 2)
     p.add_argument("--blockchain",   type=str,   default="simulation",
@@ -226,6 +385,10 @@ def build_parser():
                    help="Blockchain backend for live governance during training (default: simulation)")
     p.add_argument("--no_blockchain", action="store_true",
                    help="Disable Module 2 entirely (Module 1 only mode)")
+    p.add_argument("--governance_policy", type=str, default=None,
+                   help="Path to governance policy JSON/YAML file")
+    p.add_argument("--event_storage", type=str, default="jsonl", choices=["jsonl", "sqlite"],
+                   help="Round event storage backend")
 
     # Hidden subprocess flags
     p.add_argument("--_client_mode",   action="store_true",  help=argparse.SUPPRESS)
@@ -236,6 +399,15 @@ def build_parser():
     p.add_argument("--_server",  type=str,   default="127.0.0.1:8081", help=argparse.SUPPRESS)
     p.add_argument("--_flip_clients",  type=str,   default="",      help=argparse.SUPPRESS)
     p.add_argument("--_flip_fraction", type=float, default=1.0,     help=argparse.SUPPRESS)
+    p.add_argument("--_attack_type", type=str, default="none", help=argparse.SUPPRESS)
+    p.add_argument("--_attack_intensity", type=float, default=1.0, help=argparse.SUPPRESS)
+    p.add_argument("--_attack_end", type=int, default=-1, help=argparse.SUPPRESS)
+    p.add_argument("--_trigger_feature_count", type=int, default=3, help=argparse.SUPPRESS)
+    p.add_argument("--_trigger_value", type=float, default=5.0, help=argparse.SUPPRESS)
+    p.add_argument("--_backdoor_target_label", type=int, default=1, help=argparse.SUPPRESS)
+    p.add_argument("--_threshold_mode", type=str, default="auto", help=argparse.SUPPRESS)
+    p.add_argument("--_decision_threshold", type=float, default=0.5, help=argparse.SUPPRESS)
+    p.add_argument("--_threshold_beta", type=float, default=1.5, help=argparse.SUPPRESS)
     return p
 
 
@@ -263,11 +435,23 @@ def main():
             label_flip_clients = flip_clients_sub,
             flip_fraction      = args._flip_fraction,
             attack_start_round = args.attack_start,
+            attack_end_round   = None if args._attack_end < 0 else args._attack_end,
+            attack_type        = args._attack_type,
+            attack_intensity   = args._attack_intensity,
+            trigger_feature_count = args._trigger_feature_count,
+            trigger_value      = args._trigger_value,
+            backdoor_target_label = args._backdoor_target_label,
+            threshold_mode     = args._threshold_mode,
+            decision_threshold = args._decision_threshold,
+            threshold_beta     = args._threshold_beta,
         )
         return
 
     # ── ORCHESTRATOR MODE ─────────────────────────────────────────────────────
     import flwr as fl
+
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
     server_address = f"127.0.0.1:{args.port}"
     os.makedirs(args.log_dir, exist_ok=True)
@@ -276,7 +460,7 @@ def main():
     print(f"\n{sep}")
     print("  SPLIT 2 — TRUST-WEIGHTED FEDERATED LEARNING")
     print(f"  Model    : {args.model.upper()} | Clients: {args.num_clients} | Rounds: {args.rounds}")
-    print(f"  Attack   : {args.attack.upper()} | Malicious: {args.malicious}")
+    print(f"  Attack   : {args.attack.upper()} | Malicious: {args.malicious} | schedule={args.attack_start}..{args.attack_end if args.attack_end is not None else 'end'}")
     print(f"  Blockchain: {args.blockchain.upper() if not args.no_blockchain else 'DISABLED'}")
     print(f"{sep}\n")
 
@@ -286,7 +470,11 @@ def main():
 
     if args.attack == "label_flip":
         flip_clients_for_subprocess = args.malicious
+    elif args.attack == "backdoor":
+        flip_clients_for_subprocess = []
     elif args.attack == "gradient_scale":
+        scale_clients_for_server    = args.malicious
+    elif args.attack in ("sign_flip", "model_replacement", "sybil"):
         scale_clients_for_server    = args.malicious
     elif args.attack == "combined":
         flip_clients_for_subprocess = args.malicious
@@ -303,22 +491,30 @@ def main():
             attack_start_round = args.attack_start,
         )
     else:
-        server_attack_type = "gradient_scale" if scale_clients_for_server else "none"
+        server_attack_type = args.attack if scale_clients_for_server else "none"
         attacker = AttackSimulator(
             attack_type        = server_attack_type,
             malicious_clients  = scale_clients_for_server,
             scale_factor       = args.scale_factor,
             attack_start_round = args.attack_start,
+            attack_end_round   = args.attack_end,
+            attack_intensity   = args.attack_intensity,
+            trigger_feature_count = args.trigger_feature_count,
+            trigger_value      = args.trigger_value,
+            backdoor_target_label = args.backdoor_target_label,
         )
 
     # ── Step 2: Blockchain governance engine ──────────────────────────────────
     governance_engine = None
     if not args.no_blockchain:
+        if args.blockchain == "fabric":
+            _ensure_fabric_ready()
         governance_engine = build_governance_engine(
             log_dir   = args.log_dir,
             backend   = args.blockchain,
             enabled   = True,
             strict    = True,
+            policy_path = args.governance_policy,
         )
 
     # ── Step 3: Load data ─────────────────────────────────────────────────────
@@ -330,12 +526,27 @@ def main():
         X, y = load_dataset(args.data_path)
 
     # ── Step 4: Partition data ────────────────────────────────────────────────
-    partitions = dirichlet_partition(
-        X, y,
-        num_clients = args.num_clients,
-        alpha       = args.alpha,
-        max_samples = args.max_samples,
+    cache_path, _ = get_partition_cache_paths(args.log_dir, ".partition_cache_flwr_app.npz")
+    spec = build_partition_spec(
+        X=X,
+        y=y,
+        num_clients=args.num_clients,
+        alpha=args.alpha,
+        max_samples=args.max_samples,
+        seed=args.seed,
     )
+    partitions = load_partition_cache_if_match(cache_path, spec, args.num_clients)
+    if partitions is None:
+        partitions = dirichlet_partition(
+            X, y,
+            num_clients = args.num_clients,
+            alpha       = args.alpha,
+            max_samples = args.max_samples,
+        )
+        save_partition_cache(partitions, cache_path, spec)
+        print(f"[Main] Partition cache rebuilt -> {cache_path}")
+    else:
+        print(f"[Main] Reusing deterministic partition cache -> {cache_path}")
 
     # ── Step 5: Build trust-weighted strategy ─────────────────────────────────
     strategy = get_trust_strategy(
@@ -344,6 +555,7 @@ def main():
         log_dir          = args.log_dir,
         attack_simulator = attacker,
         governance_engine = governance_engine,
+        event_storage_backend = args.event_storage,
     )
 
     # ── Step 6: Run modern Flower simulation runtime ──────────────────────────
@@ -352,6 +564,8 @@ def main():
     def client_fn(context):
         cid = int(context.node_config.get("partition-id", context.node_id))
         part = partition_map[cid]
+        malicious_set = set(int(x) for x in args.malicious)
+        effective_attack_type = args.attack if cid in malicious_set else "none"
         client = BankFederatedClient(
             client_id          = cid,
             X_train            = part["X_train"],
@@ -363,6 +577,15 @@ def main():
             is_label_flip      = cid in set(flip_clients_for_subprocess),
             flip_fraction      = 1.0,
             attack_start_round = args.attack_start,
+            attack_end_round   = args.attack_end,
+            attack_type        = effective_attack_type,
+            attack_intensity   = args.attack_intensity,
+            trigger_feature_count = args.trigger_feature_count,
+            trigger_value      = args.trigger_value,
+            backdoor_target_label = args.backdoor_target_label,
+            threshold_mode     = args.threshold_mode,
+            decision_threshold = args.decision_threshold,
+            threshold_beta     = args.threshold_beta,
         )
         return client.to_client()
 
@@ -397,6 +620,69 @@ def main():
     print(f"  Plot → {os.path.join(args.log_dir, 'split2_training_curves.png')}")
     if not args.no_blockchain:
         print(f"\n  Governance output → {args.log_dir}/governance_output/")
+
+    repo_root = os.path.dirname(_MODULE_ROOT)
+    run_id = os.getenv("BATFL_RUN_ID", f"run-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}")
+    dataset_meta = {
+        "source": "synthetic" if (args.synthetic or args.data_path is None) else args.data_path,
+        "num_samples": int(len(y)),
+        "num_features": int(X.shape[1]),
+        "fraud_rate": float(np.mean(y)),
+    }
+    run_config = {
+        "strategy": "trust_weighted",
+        "model": args.model,
+        "num_clients": args.num_clients,
+        "rounds": args.rounds,
+        "alpha": args.alpha,
+        "fraction_fit": args.fraction_fit,
+        "threshold_mode": args.threshold_mode,
+        "decision_threshold": args.decision_threshold,
+        "threshold_beta": args.threshold_beta,
+        "event_storage": args.event_storage,
+        "attack": args.attack,
+        "attack_start": args.attack_start,
+        "attack_end": args.attack_end,
+        "attack_intensity": args.attack_intensity,
+        "malicious_clients": args.malicious,
+        "scale_factor": args.scale_factor,
+        "blockchain": ("disabled" if args.no_blockchain else args.blockchain),
+        "seed": args.seed,
+    }
+    runtime_meta = {
+        "flower_server": server_address,
+        "flower_version": str(getattr(fl, "__version__", "unknown")),
+        "backend": args.blockchain,
+        "governance_policy": args.governance_policy,
+    }
+    manifest_path = write_run_manifest(
+        repo_root=repo_root,
+        log_dir=args.log_dir,
+        run_config=run_config,
+        dataset_meta=dataset_meta,
+        runtime_meta=runtime_meta,
+        governance_output_dir=(os.path.join(args.log_dir, "governance_output") if not args.no_blockchain else None),
+    )
+    print(f"  Manifest → {manifest_path}")
+
+    if args.comparison_report:
+        summaries = []
+        for run_dir in args.comparison_dirs:
+            trust_log = os.path.join(run_dir, "trust_training_log.json")
+            split1_log = os.path.join(run_dir, "training_log.json")
+            manifest = os.path.join(run_dir, "run_manifest.json")
+            if os.path.exists(trust_log):
+                summaries.append(summarize_run(trust_log, manifest_path=manifest, label=os.path.basename(run_dir)))
+            elif os.path.exists(split1_log):
+                summaries.append(summarize_run(split1_log, manifest_path=manifest, label=os.path.basename(run_dir)))
+        if summaries:
+            report_paths = write_baseline_comparison_report(
+                summaries=summaries,
+                output_dir=args.log_dir,
+                prefix="baseline_comparison",
+            )
+            print(f"  Comparison CSV → {report_paths['csv']}")
+            print(f"  Comparison Plot → {report_paths['plot']}")
     print(f"\n  Next: python module1/split3/split3_main.py --trust_log {log_path}")
 
 

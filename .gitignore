@@ -26,6 +26,7 @@ baseline_comparison.png
 run_manifest.json
 *.png
 *.npz
+.partition_cache*.meta.json
 demo_trust_log.json
 hash_chain.json
 
@@ -71,6 +72,8 @@ module1/split3/hlf/chaincode/trust_registry/vendor/
 ray_results/
 *.rllib/
 *.jsonl
+report_bundle/
+batfl_report_bundle_*.zip
 
 # Node.js
 node_modules/
