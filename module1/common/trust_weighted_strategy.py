@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 import json
-import hashlib
+import uuid
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timezone
@@ -37,9 +37,19 @@ from flwr.server.strategy import Strategy
 try:
     from module1.common.trust_scoring import TrustScorer, AggregationResult
     from module1.common.fedavg_strategy import weighted_average  # reuse metric aggregation from Split 1
+    from module1.common.model_hashing import hash_model_parameters_canonical
+    from module1.common.round_event_security import (
+        ROUND_EVENT_GENESIS,
+        create_signed_round_event,
+    )
 except ImportError:
     from common.trust_scoring import TrustScorer, AggregationResult
     from common.fedavg_strategy import weighted_average  # reuse metric aggregation from Split 1
+    from common.model_hashing import hash_model_parameters_canonical
+    from common.round_event_security import (
+        ROUND_EVENT_GENESIS,
+        create_signed_round_event,
+    )
 
 
 # ??????????????????????????????????????????????????????????????????????????
@@ -102,10 +112,18 @@ class TrustWeightedFedAvg(Strategy):
         self.current_global_params: Optional[List[np.ndarray]] = None
         self.round_logs:  List[Dict] = []
         self._pending_round_logs: Dict[int, Dict] = {}
+        self.round_event_log_path = os.path.join(log_dir, "round_events.jsonl")
+        self._last_round_event_hash: str = ROUND_EVENT_GENESIS
+        self._round_event_run_id: str = os.getenv("BATFL_RUN_ID", f"run-{uuid.uuid4().hex[:12]}")
+        self._round_event_sequence: int = 0
+        self._round_event_key_id: str = os.getenv("BATFL_ROUND_EVENT_KEY_ID", "coordinator-round-event")
+        self._round_event_key: bytes = os.getenv("BATFL_ROUND_EVENT_KEY", "batfl-dev-round-event-key").encode("utf-8")
         self.best_f1:     float = 0.0
         self.best_round:  int   = 0
 
         os.makedirs(log_dir, exist_ok=True)
+        if os.path.exists(self.round_event_log_path):
+            os.remove(self.round_event_log_path)
         print(
             f"\n[Server] TrustWeightedFedAvg initialised | "
             f"{num_clients} clients | "
@@ -275,15 +293,19 @@ class TrustWeightedFedAvg(Strategy):
 
         global_f1  = global_metrics.get("f1", 0)
         global_auc = global_metrics.get("auc_roc", 0)
+        global_pr_auc = global_metrics.get("pr_auc", 0)
         g_acc  = global_metrics.get("accuracy", 0)
         g_bal  = global_metrics.get("balanced_accuracy", 0)
         g_mcc  = global_metrics.get("mcc", 0)
         g_spec = global_metrics.get("specificity", 0)
         g_pre  = global_metrics.get("precision", 0)
         g_rec  = global_metrics.get("recall", 0)
+        g_fraud_pre = global_metrics.get("fraud_precision", g_pre)
+        g_fraud_rec = global_metrics.get("fraud_recall", g_rec)
+        g_thresh = global_metrics.get("decision_threshold", 0.5)
         print(
             f"\n  [Global Eval R{server_round:02d}]"
-            f"  F1={global_f1:.4f}  AUC={global_auc:.4f}"
+            f"  F1={global_f1:.4f}  AUC={global_auc:.4f}  PR-AUC={global_pr_auc:.4f}"
             f"  Recall={g_rec:.4f}  Precision={g_pre:.4f}"
         )
         print(
@@ -302,8 +324,12 @@ class TrustWeightedFedAvg(Strategy):
             round_log.update({
                 "global_f1":               global_f1,
                 "global_auc":              global_auc,
+                "global_pr_auc":           global_pr_auc,
                 "global_recall":           global_metrics.get("recall", 0),
                 "global_precision":        global_metrics.get("precision", 0),
+                "global_fraud_recall":     g_fraud_rec,
+                "global_fraud_precision":  g_fraud_pre,
+                "global_decision_threshold": g_thresh,
                 "global_accuracy":         global_metrics.get("accuracy", 0),
                 "global_balanced_accuracy":global_metrics.get("balanced_accuracy", 0),
                 "global_mcc":              global_metrics.get("mcc", 0),
@@ -312,7 +338,24 @@ class TrustWeightedFedAvg(Strategy):
                 "global_fp":               global_metrics.get("fp", 0),
                 "global_tn":               global_metrics.get("tn", 0),
                 "global_fn":               global_metrics.get("fn", 0),
+                "global_confusion_matrix": [
+                    [int(global_metrics.get("tn", 0)), int(global_metrics.get("fp", 0))],
+                    [int(global_metrics.get("fn", 0)), int(global_metrics.get("tp", 0))],
+                ],
             })
+
+            round_event = create_signed_round_event(
+                round_log=round_log,
+                prev_event_hash=self._last_round_event_hash,
+                key_bytes=self._round_event_key,
+                key_id=self._round_event_key_id,
+                run_id=self._round_event_run_id,
+                event_sequence=self._round_event_sequence + 1,
+            )
+            round_log["round_event"] = round_event
+            self._append_round_event(round_event)
+            self._last_round_event_hash = str(round_event.get("event_hash", ROUND_EVENT_GENESIS))
+            self._round_event_sequence += 1
 
             # Boundary 2: sign+commit round attestation before next round begins.
             if self.governance_engine is not None:
@@ -360,11 +403,9 @@ class TrustWeightedFedAvg(Strategy):
     # -- Hashing (for Split 3 blockchain) -------------------------------------
 
     def _hash_params(self, params: List[np.ndarray]) -> str:
-        """Compute SHA-256 hash of model parameters for blockchain logging."""
-        hasher = hashlib.sha256()
-        for p in params:
-            hasher.update(p.tobytes())
-        return hasher.hexdigest()
+        """Compute canonical SHA-256 hash of model parameters for governance logging."""
+        digest, _, _ = hash_model_parameters_canonical(params)
+        return digest
 
     # -- Logging ---------------------------------------------------------------
 
@@ -402,6 +443,11 @@ class TrustWeightedFedAvg(Strategy):
         with open(path, "w") as f:
             json.dump(self.round_logs, f, indent=2)
 
+    def _append_round_event(self, event: Dict) -> None:
+        with open(self.round_event_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, sort_keys=True))
+            f.write("\n")
+
     def print_summary(self) -> None:
         """Final summary after all rounds — shows all evaluation metrics."""
         trust_summary = self.trust_scorer.get_trust_summary()
@@ -414,8 +460,12 @@ class TrustWeightedFedAvg(Strategy):
         print(f"\n  === FINAL ROUND METRICS ===")
         print(f"  F1 Score:              {last.get('global_f1', 0):.4f}")
         print(f"  AUC-ROC:               {last.get('global_auc', 0):.4f}")
+        print(f"  PR-AUC:                {last.get('global_pr_auc', 0):.4f}")
         print(f"  Recall (Sensitivity):  {last.get('global_recall', 0):.4f}")
         print(f"  Precision:             {last.get('global_precision', 0):.4f}")
+        print(f"  Fraud Recall:          {last.get('global_fraud_recall', 0):.4f}")
+        print(f"  Fraud Precision:       {last.get('global_fraud_precision', 0):.4f}")
+        print(f"  Decision Threshold:    {last.get('global_decision_threshold', 0.5):.4f}")
         print(f"  Accuracy:              {last.get('global_accuracy', 0):.4f}  <- raw (misleading on imbalanced data)")
         print(f"  Balanced Accuracy:     {last.get('global_balanced_accuracy', 0):.4f}  <- correct for imbalanced")
         print(f"  MCC:                   {last.get('global_mcc', 0):.4f}  (range [-1,1], >0.5=good, >0.7=strong)")

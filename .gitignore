@@ -16,9 +16,14 @@ env/
 # Generated outputs
 logs_split1/
 logs_split2/
+logs_fabric/
 governance_output/
 governance_output_eth/
 governance_output_eth_check/
+baseline_comparison.csv
+baseline_comparison.md
+baseline_comparison.png
+run_manifest.json
 *.png
 *.npz
 demo_trust_log.json
@@ -30,8 +35,11 @@ channel-artifacts/
 fabric-samples/
 *.tar.gz
 module1/split3/hlf/fabric_connection.env
+module1/split3/hlf_enterprise/fabric_connection.env
 module1/split3/hlf/*.log
 module1/split3/hlf/*.pid
+module1/split3/hlf/setup_run.log
+module1/split3/hlf_enterprise/setup_run.log
 
 # Dataset
 data/creditcard.csv
@@ -46,6 +54,7 @@ docker_info.code
 docker_info_probe.code
 timeout_path.txt
 wsl_probe.txt
+debug_output.txt
 error.log
 error3.log
 ganache.log
@@ -61,6 +70,7 @@ module1/split3/hlf/chaincode/trust_registry/vendor/
 *.db-wal
 ray_results/
 *.rllib/
+*.jsonl
 
 # Node.js
 node_modules/

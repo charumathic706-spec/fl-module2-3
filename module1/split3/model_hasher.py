@@ -30,6 +30,11 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+try:
+    from module1.common.model_hashing import hash_model_parameters_canonical
+except ImportError:
+    hash_model_parameters_canonical = None
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Data structures
@@ -338,13 +343,15 @@ class ModelHasher:
 
         Returns: (hex_digest, param_count, total_bytes)
         """
+        if hash_model_parameters_canonical is not None:
+            return hash_model_parameters_canonical(params)
+
+        # Fallback path retained for standalone Split 3 environments.
         hasher = hashlib.sha256()
         total_bytes = 0
         for arr in params:
-            # Normalise dtype for cross-platform consistency
-            data = arr.astype(np.float32).flatten().tobytes()
-            # Prefix each tensor with its shape descriptor
             shape_tag = struct.pack(f">{len(arr.shape)}I", *arr.shape)
+            data = arr.astype(np.float32).flatten().tobytes()
             hasher.update(shape_tag)
             hasher.update(data)
             total_bytes += len(data)

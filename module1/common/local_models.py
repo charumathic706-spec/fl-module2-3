@@ -52,7 +52,7 @@ from typing import Any, Dict, List, Optional
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
-    balanced_accuracy_score, matthews_corrcoef, confusion_matrix,
+    balanced_accuracy_score, matthews_corrcoef, confusion_matrix, average_precision_score,
 )
 
 RANDOM_SEED = 42
@@ -76,11 +76,16 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> Dict
     The server's aggregate_evaluate() then logged all of them as 0.0 every round.
     """
     auc = 0.0
+    pr_auc = 0.0
     if len(np.unique(y_true)) == 2:
         try:
             auc = float(roc_auc_score(y_true, y_prob))
         except Exception:
             auc = 0.0
+        try:
+            pr_auc = float(average_precision_score(y_true, y_prob))
+        except Exception:
+            pr_auc = 0.0
 
     # Confusion matrix: [[TN, FP], [FN, TP]]
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
@@ -95,14 +100,50 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> Dict
         "precision":         float(precision_score(y_true, y_pred, zero_division=0)),
         "recall":            float(recall_score(y_true, y_pred, zero_division=0)),
         "auc_roc":           auc,
+        "pr_auc":            pr_auc,
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "mcc":               float(matthews_corrcoef(y_true, y_pred)),
         "specificity":       specificity,
+        "fraud_precision":   float(precision_score(y_true, y_pred, zero_division=0)),
+        "fraud_recall":      float(recall_score(y_true, y_pred, zero_division=0)),
         "tp":                float(tp),
         "fp":                float(fp),
         "tn":                float(tn),
         "fn":                float(fn),
+        "confusion_matrix":  [[int(tn), int(fp)], [int(fn), int(tp)]],
     }
+
+
+def _select_decision_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    *,
+    mode: str = "auto",
+    fixed_threshold: float = 0.5,
+    beta: float = 1.5,
+) -> float:
+    if mode == "fixed":
+        return float(max(0.0, min(1.0, fixed_threshold)))
+
+    best_score, best_thresh = 0.0, 0.5
+    for thresh in np.arange(0.03, 0.91, 0.02):
+        y_pred_t = (y_prob >= thresh).astype(int)
+        p = float(precision_score(y_true, y_pred_t, zero_division=0))
+        r = float(recall_score(y_true, y_pred_t, zero_division=0))
+        denom = (beta ** 2 * p + r)
+        fb = (1 + beta ** 2) * p * r / denom if denom > 0 else 0.0
+        if fb > best_score:
+            best_score, best_thresh = fb, thresh
+
+    if best_score == 0.0:
+        pos_probs = y_prob[y_true == 1] if y_true.sum() > 0 else y_prob
+        if len(pos_probs) > 0 and float(np.max(pos_probs)) > 0.0:
+            adaptive_thresh = float(np.percentile(pos_probs, 20))
+            best_thresh = max(adaptive_thresh, 1e-4)
+        else:
+            best_thresh = 0.01
+
+    return float(best_thresh)
 
 
 # =============================================================================
@@ -186,13 +227,19 @@ class DNNFraudModel:
                                           # pos_weight < 1.0 PENALISES fraud (counter-intuitive).
                                           # After SMOTE fraud is ~47% of legit; pw=2.0 gives a
                                           # mild nudge that improves recall substantially.
-        grad_clip:   float     = 0.5  # was 1.0; tighter clipping stabilises C1 oscillation,
+        grad_clip:   float     = 0.5,  # was 1.0; tighter clipping stabilises C1 oscillation
+        threshold_mode: str    = "auto",
+        decision_threshold: float = 0.5,
+        threshold_beta: float = 1.5,
     ):
         self.device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.epochs     = epochs
         self.batch_size = batch_size
         self.grad_clip  = grad_clip
         self.input_dim  = input_dim
+        self.threshold_mode = str(threshold_mode).lower().strip()
+        self.decision_threshold = float(decision_threshold)
+        self.threshold_beta = float(threshold_beta)
 
         self.net = FraudDNN(input_dim, hidden_dims or [256, 128, 64], dropout).to(self.device)
 
@@ -283,49 +330,17 @@ class DNNFraudModel:
 
         y_prob = torch.sigmoid(torch.tensor(logits)).numpy()
 
-        # FIXED: Find the threshold that maximises F2 (β=2), not F1.
-        # F2 = (1+β²)·P·R / (β²·P + R) with β=2 weights recall 4× vs precision.
-        # v5 showed precision→0.96, recall→0.75: clients picked thresholds that
-        # eliminated all FP (P=1.0) at the cost of missing 25% of fraud.
-        # F2-optimal threshold shifts the operating point left on the P-R curve,
-        # accepting moderate false positives to achieve substantially higher recall.
-        # β=1.5: analytical sweep showed β=2.0 selected rec=0.815/prec=0.750
-        # (F1=0.781) when β=1.5 picks rec=0.784/prec=0.850 (F1=0.816).
-        # β>1.5 over-penalises precision, finding high-recall/low-precision
-        # points that hurt global F1. β=1.5 is the empirical sweet spot.
-        # Threshold start lowered 0.05→0.03 with step 0.02 for finer
-        # resolution in the 0.03-0.15 range where P-R tradeoff is steepest.
-        beta = 1.5
-        best_score, best_thresh = 0.0, 0.5
-        for thresh in np.arange(0.03, 0.91, 0.02):
-            y_pred_t = (y_prob >= thresh).astype(int)
-            p = float(precision_score(y_test, y_pred_t, zero_division=0))
-            r = float(recall_score(y_test, y_pred_t, zero_division=0))
-            denom = (beta**2 * p + r)
-            fb = (1 + beta**2) * p * r / denom if denom > 0 else 0.0
-            if fb > best_score:
-                best_score, best_thresh = fb, thresh
-
-        # FIX v11: Adaptive fallback when trust-weighted aggregated model
-        # produces very low probabilities (all < 0.03) so no threshold in
-        # [0.03, 0.91] detects any fraud.  This happens from round 2 onwards
-        # when the attacker's weight → 0 and the benign-only aggregated model
-        # outputs near-zero sigmoid scores for fraud samples.
-        # Solution: if the sweep found nothing, use the 10th-percentile of
-        # positive-class probabilities as the threshold (top-10% flagged as
-        # fraud).  This keeps recall reasonable without blowing up FP.
-        if best_score == 0.0:
-            pos_probs = y_prob[y_test == 1] if y_test.sum() > 0 else y_prob
-            if len(pos_probs) > 0 and pos_probs.max() > 0:
-                # Use 20th-percentile of fraud-sample probs so we catch ~80%
-                adaptive_thresh = float(np.percentile(pos_probs, 20))
-                adaptive_thresh = max(adaptive_thresh, 1e-4)   # never be 0
-                best_thresh = adaptive_thresh
-            else:
-                best_thresh = 0.01  # last resort
+        best_thresh = _select_decision_threshold(
+            y_test,
+            y_prob,
+            mode=self.threshold_mode,
+            fixed_threshold=self.decision_threshold,
+            beta=self.threshold_beta,
+        )
 
         y_pred = (y_prob >= best_thresh).astype(int)
         result = _metrics(y_test, y_pred, y_prob)
+        result["decision_threshold"] = float(best_thresh)
 
         try:
             result["loss"] = float(
@@ -390,7 +405,14 @@ class DNNFraudModel:
 class LogisticFraudModel:
     """Logistic Regression baseline — exposes the same interface as DNNFraudModel."""
 
-    def __init__(self, max_iter: int = 500, C: float = 1.0):
+    def __init__(
+        self,
+        max_iter: int = 500,
+        C: float = 1.0,
+        threshold_mode: str = "auto",
+        decision_threshold: float = 0.5,
+        threshold_beta: float = 1.5,
+    ):
         self.model = LogisticRegression(
             max_iter=max_iter,
             C=C,
@@ -401,6 +423,9 @@ class LogisticFraudModel:
         self._fitted             = False
         self._params_before:     Optional[List[np.ndarray]] = None
         self._last_gradients:    Optional[List[np.ndarray]] = None
+        self.threshold_mode = str(threshold_mode).lower().strip()
+        self.decision_threshold = float(decision_threshold)
+        self.threshold_beta = float(threshold_beta)
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
         if self._fitted:
@@ -412,9 +437,18 @@ class LogisticFraudModel:
             self._last_gradients = [a - b for a, b in zip(after, self._params_before)]
 
     def evaluate(self, X_test: np.ndarray, y_test: np.ndarray) -> Dict[str, float]:
-        y_pred = self.model.predict(X_test)
         y_prob = self.model.predict_proba(X_test)[:, 1]
-        return _metrics(y_test, y_pred, y_prob)
+        best_thresh = _select_decision_threshold(
+            y_test,
+            y_prob,
+            mode=self.threshold_mode,
+            fixed_threshold=self.decision_threshold,
+            beta=self.threshold_beta,
+        )
+        y_pred = (y_prob >= best_thresh).astype(int)
+        result = _metrics(y_test, y_pred, y_prob)
+        result["decision_threshold"] = float(best_thresh)
+        return result
 
     def get_params(self) -> List[np.ndarray]:
         if not self._fitted:
@@ -439,7 +473,14 @@ class LogisticFraudModel:
 # FACTORY — used by flower_client.py
 # =============================================================================
 
-def get_model(model_type: str, input_dim: int) -> Any:
+def get_model(
+    model_type: str,
+    input_dim: int,
+    *,
+    threshold_mode: str = "auto",
+    decision_threshold: float = 0.5,
+    threshold_beta: float = 1.5,
+) -> Any:
     """
     Instantiate a local fraud detection model by name.
 
@@ -453,9 +494,18 @@ def get_model(model_type: str, input_dim: int) -> Any:
     """
     t = model_type.strip().lower()
     if t == "dnn":
-        return DNNFraudModel(input_dim=input_dim)
+        return DNNFraudModel(
+            input_dim=input_dim,
+            threshold_mode=threshold_mode,
+            decision_threshold=decision_threshold,
+            threshold_beta=threshold_beta,
+        )
     elif t in ("logistic", "lr"):
-        return LogisticFraudModel()
+        return LogisticFraudModel(
+            threshold_mode=threshold_mode,
+            decision_threshold=decision_threshold,
+            threshold_beta=threshold_beta,
+        )
     else:
         raise ValueError(
             f"Unknown model_type='{model_type}'. "

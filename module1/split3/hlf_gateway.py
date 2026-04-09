@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shlex
+import time
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,9 +27,21 @@ logger = logging.getLogger(__name__)
 # ── Locate fabric_connection.env ──────────────────────────────────────────────
 def _find_env() -> Optional[Path]:
     this = Path(__file__).resolve()
+    env_override = os.getenv("BATFL_FABRIC_ENV_FILE", "").strip()
+    if env_override:
+        p = Path(env_override)
+        if p.exists():
+            return p
+
+    cwd = Path(os.getcwd())
     for p in [
         this.parent / "hlf" / "fabric_connection.env",
+        this.parent / "hlf_enterprise" / "fabric_connection.env",
         this.parent.parent / "split3" / "hlf" / "fabric_connection.env",
+        this.parent.parent / "split3" / "hlf_enterprise" / "fabric_connection.env",
+        cwd / "module1" / "split3" / "hlf" / "fabric_connection.env",
+        cwd / "module1" / "split3" / "hlf_enterprise" / "fabric_connection.env",
+        cwd / "module1" / "split3" / "fabric_connection.env",
     ]:
         if p.exists():
             return p
@@ -83,7 +96,7 @@ class HLFGateway:
         self._channel  = env.get("FABRIC_CHANNEL",   "mychannel")
         self._chaincode= env.get("FABRIC_CHAINCODE",  "trust-registry")
         self._env      = env
-        self._project_root = Path(__file__).resolve().parents[2]
+        self._project_root = self._resolve_project_root()
         self._hlf_dir_wsl = _to_wsl_path(str(self._project_root / "module1" / "split3" / "hlf"))
         self._fabric_bin_wsl = _to_wsl_path(str(self._project_root / "fabric-samples" / "bin"))
         self._fabric_cfg_wsl = _to_wsl_path(str(self._project_root / "fabric-samples" / "config"))
@@ -110,10 +123,41 @@ class HLFGateway:
         }
         logger.info(f"[HLFGateway] Connected via Fabric CLI: peer={self._peer_address} org={msp_id} ch={self._channel}")
 
+    def _resolve_project_root(self) -> Path:
+        """Resolve repository root even when running from Flower packaged app paths."""
+        env_root = os.getenv("BATFL_PROJECT_ROOT", "").strip()
+        if env_root:
+            p = Path(env_root)
+            if (p / "fabric-samples" / "test-network").exists():
+                return p
+
+        cwd = Path(os.getcwd())
+        if (cwd / "fabric-samples" / "test-network").exists():
+            return cwd
+
+        for parent in cwd.parents:
+            if (parent / "fabric-samples" / "test-network").exists():
+                return parent
+
+        fallback = Path(__file__).resolve().parents[2]
+        return fallback
+
     # ── Model Registry ────────────────────────────────────────────────────────
     def register_model(self, round_num, model_hash, block_hash, prev_block_hash,
                        global_f1=0.0, global_auc=0.0, trusted_clients=None,
                        flagged_clients=None, param_count=0, total_bytes=0):
+        # Make round registration idempotent to support replays/restarts.
+        existing = self.get_model_record(round_num)
+        if existing is not None:
+            existing_hash = str(existing.get("modelHash", existing.get("model_hash", "")))
+            if existing_hash == model_hash:
+                tx = f"ALREADY_COMMITTED_{round_num}"
+                print(f"  [HLF] ✅ Round {round_num} already committed. tx={tx}")
+                return tx, True
+            tx = f"ROUND_CONFLICT_{round_num}"
+            print(f"  [HLF] ❌ Round {round_num} hash conflict with existing ledger entry.")
+            return tx, False
+
         args = [
             str(round_num), model_hash, block_hash, prev_block_hash,
             str(round(global_f1, 6)), str(round(global_auc, 6)),
@@ -136,7 +180,15 @@ class HLFGateway:
 
     def get_model_record(self, round_num):
         r = self._evaluate("GetModel", [str(round_num)])
-        return json.loads(r) if r else None
+        if not r:
+            return None
+        try:
+            parsed = json.loads(r)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict) and parsed.get("found") is False:
+            return None
+        return parsed
 
     def get_all_model_records(self):
         r = self._evaluate("QueryAllModels", [])
@@ -207,38 +259,73 @@ class HLFGateway:
 
     # ── Internal ──────────────────────────────────────────────────────────────
     def _submit(self, fn: str, args: List[str]) -> Tuple[str, bool]:
-        try:
-            command = self._build_peer_command(
-                ["chaincode", "invoke",
-                 "-o", "localhost:7050",
-                 "--ordererTLSHostnameOverride", "orderer.example.com",
-                 "--tls",
-                 "--cafile", self._orderer_ca,
-                 "-C", self._channel,
-                 "-n", self._chaincode,
-                 "--peerAddresses", self._peer1_addr,
-                 "--tlsRootCertFiles", self._peer1_tls,
-                 "--peerAddresses", self._peer2_addr,
-                 "--tlsRootCertFiles", self._peer2_tls,
-                 "--waitForEvent",
-                 "--waitForEventTimeout", "60s",
-                 "-c", self._chaincode_payload(fn, args)],
-            )
-            result = subprocess.run(
-                ["wsl", "bash", "-lc", command],
-                capture_output=True,
-                text=True,
-            )
-            output = (result.stdout or "") + (result.stderr or "")
-            if result.returncode != 0:
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                command = self._build_peer_command(
+                    ["chaincode", "invoke",
+                     "-o", "localhost:7050",
+                     "--ordererTLSHostnameOverride", "orderer.example.com",
+                     "--tls",
+                     "--cafile", self._orderer_ca,
+                     "-C", self._channel,
+                     "-n", self._chaincode,
+                     "--peerAddresses", self._peer1_addr,
+                     "--tlsRootCertFiles", self._peer1_tls,
+                     "--peerAddresses", self._peer2_addr,
+                     "--tlsRootCertFiles", self._peer2_tls,
+                     "--waitForEvent",
+                     "--waitForEventTimeout", "60s",
+                     "-c", self._chaincode_payload(fn, args)],
+                )
+                result = subprocess.run(
+                    ["wsl", "bash", "-lc", command],
+                    capture_output=True,
+                    text=True,
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                if result.returncode == 0:
+                    tx_id = self._derive_tx_id(fn, args, output)
+                    return tx_id, True
+
                 msg = (result.stderr or result.stdout or "").strip()
+                transient = self._is_transient_submit_error(msg)
+                if transient and attempt < max_attempts:
+                    backoff = 2 ** (attempt - 1)
+                    logger.warning(
+                        f"[HLF] Submit {fn} transient failure (attempt {attempt}/{max_attempts}): {msg[:220]}"
+                    )
+                    time.sleep(backoff)
+                    continue
+
                 logger.error(f"[HLF] Submit {fn} failed: {msg}")
                 return f"error:{msg[:180]}", False
-            tx_id = self._derive_tx_id(fn, args, output)
-            return tx_id, result.returncode == 0
-        except Exception as e:
-            logger.error(f"[HLF] Submit {fn}: {e}")
-            return f"error:{e}", False
+            except Exception as e:
+                if attempt < max_attempts:
+                    backoff = 2 ** (attempt - 1)
+                    logger.warning(
+                        f"[HLF] Submit {fn} exception (attempt {attempt}/{max_attempts}): {e}"
+                    )
+                    time.sleep(backoff)
+                    continue
+                logger.error(f"[HLF] Submit {fn}: {e}")
+                return f"error:{e}", False
+
+        return "error:submit retries exhausted", False
+
+    @staticmethod
+    def _is_transient_submit_error(msg: str) -> bool:
+        text = (msg or "").lower()
+        transient_markers = [
+            "keepalive ping failed",
+            "code = unavailable",
+            "context deadline exceeded",
+            "failed to receive ack",
+            "connection reset by peer",
+            "deadline exceeded",
+            "temporarily unavailable",
+        ]
+        return any(marker in text for marker in transient_markers)
 
     def _evaluate(self, fn: str, args: List[str]) -> Optional[str]:
         try:

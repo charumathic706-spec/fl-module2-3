@@ -177,7 +177,11 @@ func (t *TrustRegistryChaincode) registerModel(stub shim.ChaincodeStubInterface,
 func (t *TrustRegistryChaincode) getModel(stub shim.ChaincodeStubInterface, roundStr string) pb.Response {
 	b, err := stub.GetState("MODEL:" + roundStr)
 	if err != nil || b == nil {
-		return failure(fmt.Errorf("round %s not found", roundStr))
+		out, _ := json.Marshal(map[string]interface{}{
+			"found": false,
+			"round": roundStr,
+		})
+		return success(out)
 	}
 	return success(b)
 }

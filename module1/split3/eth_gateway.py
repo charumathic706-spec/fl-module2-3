@@ -102,12 +102,16 @@ class EthBlockchainGateway:
         self,
         ganache_url: str = GANACHE_URL,
         org_msp:     str = "Org1MSP",
+        deployment_file: Optional[str] = None,
+        reuse_existing_deployment: bool = False,
     ):
         self.url     = ganache_url
         self.org_msp = org_msp
         self._w3     = None
         self._contract = None
         self._account  = None
+        self._deployment_file = deployment_file or _DEPLOY_FILE
+        self._reuse_existing_deployment = reuse_existing_deployment
 
         self._init_web3()
         self._load_or_deploy()
@@ -146,9 +150,15 @@ class EthBlockchainGateway:
 
     def _load_or_deploy(self):
         """Load existing contract or deploy fresh one."""
+        if not self._reuse_existing_deployment and os.path.exists(self._deployment_file):
+            try:
+                os.remove(self._deployment_file)
+            except OSError:
+                pass
+
         # Try loading saved deployment
-        if os.path.exists(_DEPLOY_FILE):
-            with open(_DEPLOY_FILE) as f:
+        if self._reuse_existing_deployment and os.path.exists(self._deployment_file):
+            with open(self._deployment_file) as f:
                 info = json.load(f)
             addr = info.get("address")
             abi  = info.get("abi")
@@ -181,23 +191,32 @@ class EthBlockchainGateway:
 
         # Save deployment info
         info = {"address": addr, "abi": abi, "deploy_tx": tx_hash.hex()}
-        with open(_DEPLOY_FILE, "w") as f:
+        os.makedirs(os.path.dirname(self._deployment_file), exist_ok=True)
+        with open(self._deployment_file, "w") as f:
             json.dump(info, f, indent=2)
 
         print(f"[Ethereum] Contract deployed")
         print(f"  Address: {addr}")
         print(f"  Tx:      {tx_hash.hex()}")
-        print(f"  Saved:   {_DEPLOY_FILE}")
+        print(f"  Saved:   {self._deployment_file}")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _transact(self, fn, *args) -> Tuple[str, bool]:
         """Send a state-changing transaction. Returns (tx_hash, success)."""
         try:
-            tx_hash = fn(*args).transact({
-                "from": self._account,
-                "gas":  600_000,
-            })
+            call = fn(*args)
+            tx_params = {"from": self._account}
+
+            # Audit events can carry larger JSON payloads; estimate gas and add headroom.
+            try:
+                est = int(call.estimate_gas(tx_params))
+                gas = max(800_000, int(est * 2.0))
+                tx_params["gas"] = min(gas, 8_000_000)
+            except Exception:
+                tx_params["gas"] = 6_000_000
+
+            tx_hash = call.transact(tx_params)
             receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash)
             ok      = receipt["status"] == 1
             return tx_hash.hex(), ok
@@ -244,6 +263,19 @@ class EthBlockchainGateway:
         trusted = [int(c) for c in (trusted_clients or [])]
         flagged = [int(c) for c in (flagged_clients or [])]
 
+        # Make round registration idempotent for re-runs against an existing chain.
+        # If the same round already exists with the same model hash, treat as success.
+        # If it exists with a different hash, fail loudly to preserve integrity.
+        existing = self.get_model_record(round_num)
+        if existing is not None:
+            if existing.get("model_hash") == model_hash:
+                tx = f"ALREADY_COMMITTED_{round_num}"
+                print(f"  [Ethereum] Round {round_num:02d} already committed | tx={tx}")
+                return tx, True
+            tx = f"ROUND_CONFLICT_{round_num}"
+            print(f"  [Ethereum] WARNING: Round {round_num} hash conflict on chain")
+            return tx, False
+
         tx, ok = self._transact(
             self._contract.functions.registerModel,
             round_num, model_hash, block_hash, prev_block_hash,
@@ -267,6 +299,27 @@ class EthBlockchainGateway:
         is_valid, _ = result
         return bool(is_valid)
 
+    def get_model_record(self, round_num: int) -> Optional[Dict]:
+        """Read one model record from chain if the contract exposes getModel."""
+        try:
+            r = self._call(self._contract.functions.getModel, round_num)
+            if not r:
+                return None
+            model_hash, block_hash, prev_block_hash, f1_int, auc_int, ts, exists = r
+            if not exists:
+                return None
+            return {
+                "round": int(round_num),
+                "model_hash": model_hash,
+                "block_hash": block_hash,
+                "prev_block_hash": prev_block_hash,
+                "global_f1": float(f1_int) / 1_000_000.0,
+                "global_auc": float(auc_int) / 1_000_000.0,
+                "timestamp": int(ts),
+            }
+        except Exception:
+            return None
+
     def verify_full_chain(self) -> Tuple[bool, int]:
         """
         Verify full hash chain on-chain.
@@ -286,10 +339,14 @@ class EthBlockchainGateway:
         detail:     str,
         severity:   str = "HIGH",
     ) -> str:
-        tx, _ = self._transact(
+        tx, ok = self._transact(
             self._contract.functions.raiseTamperAlert,
             round_num, alert_type, detail, severity,
         )
+        if not ok:
+            raise RuntimeError(
+                f"[Ethereum] Tamper alert transaction failed for round {round_num}: {tx}"
+            )
         return tx
 
     def get_tamper_alerts(self) -> List[Dict]:
@@ -318,10 +375,14 @@ class EthBlockchainGateway:
         actor:      str = "FederatedCoordinator",
     ) -> str:
         data_str = json.dumps(data, default=str)
-        tx, _ = self._transact(
+        tx, ok = self._transact(
             self._contract.functions.appendAuditEvent,
             event_type, round_num, actor, data_str,
         )
+        if not ok:
+            raise RuntimeError(
+                f"[Ethereum] Audit event transaction failed for round {round_num}: {tx}"
+            )
         return tx
 
     def get_audit_trail(self) -> List[Dict]:

@@ -102,9 +102,9 @@ def parse_args():
     p.add_argument("--trust_log",   type=str, default=None,
                    help="Path to trust_training_log.json from Split 2")
     p.add_argument("--output_dir",  type=str, default="./governance_output")
-    p.add_argument("--blockchain",  type=str, default="simulation",
+    p.add_argument("--blockchain",  type=str, default="fabric",
                    choices=["simulation", "ganache", "fabric"],
-                   help="Blockchain backend (default: simulation)")
+                   help="Blockchain backend (default: fabric)")
     p.add_argument("--tamper_round",type=int, default=None,
                    help="Inject tamper at this round to demo detection")
     p.add_argument("--demo",        action="store_true",
@@ -113,6 +113,12 @@ def parse_args():
     p.add_argument("--anomaly_threshold",  type=float, default=0.5)
     p.add_argument("--quarantine_after",   type=int,   default=3)
     p.add_argument("--verify_every",       type=int,   default=5)
+    p.add_argument("--policy", type=str, default=None,
+                   help="Path to governance policy JSON/YAML")
+    p.add_argument("--audit_chain", action="store_true",
+                   help="Read-only audit from blockchain attestations (ignores trust_log)")
+    p.add_argument("--allow_unsigned_events", action="store_true",
+                   help="Allow legacy trust logs without signed round_event records")
     return p.parse_args()
 
 
@@ -123,20 +129,6 @@ def main():
     print("  SPLIT 3 — BLOCKCHAIN GOVERNANCE LAYER")
     print(f"  Backend  : {args.blockchain.upper()}")
     print("=" * 65)
-
-    # ── Trust log ─────────────────────────────────────────────────────────────
-    if args.demo:
-        trust_log_path = "./demo_trust_log.json"
-        generate_demo_trust_log(num_rounds=args.demo_rounds, output_path=trust_log_path)
-    elif args.trust_log is None:
-        print("\n[Error] Provide --trust_log or use --demo")
-        sys.exit(1)
-    else:
-        trust_log_path = args.trust_log
-
-    if not os.path.exists(trust_log_path):
-        print(f"\n[Error] Trust log not found: {trust_log_path}")
-        sys.exit(1)
 
     # ── Configure governance engine ───────────────────────────────────────────
     backend = args.blockchain.lower()
@@ -149,10 +141,38 @@ def main():
         expected_backend       = backend,
         require_backend_match  = (backend != "simulation"),
         fail_on_commit_error   = True,
+        require_verified_round_events = (not args.allow_unsigned_events and not args.demo),
+        policy_path            = args.policy,
         output_dir             = args.output_dir,
     )
 
     engine = GovernanceEngine(config)
+
+    # ── Read-only blockchain audit mode ───────────────────────────────────────
+    if args.audit_chain:
+        t0 = time.time()
+        audit = engine.audit_blockchain_attestations()
+        elapsed = time.time() - t0
+        print(f"\n[Main] Blockchain audit completed in {elapsed:.2f}s")
+        print(f"  Rounds discovered: {audit['round_count']}")
+        print(f"  Verified rounds:   {audit['verified_count']}")
+        print(f"  Failed rounds:     {audit['failed_count']}")
+        print(f"  Overall status:    {'PASS' if audit['all_verified'] else 'FAIL'}")
+        return
+
+    # ── Trust log (legacy replay mode) ──────────────────────────────────────
+    if args.demo:
+        trust_log_path = "./demo_trust_log.json"
+        generate_demo_trust_log(num_rounds=args.demo_rounds, output_path=trust_log_path)
+    elif args.trust_log is None:
+        print("\n[Error] Provide --trust_log or use --demo")
+        sys.exit(1)
+    else:
+        trust_log_path = args.trust_log
+
+    if not os.path.exists(trust_log_path):
+        print(f"\n[Error] Trust log not found: {trust_log_path}")
+        sys.exit(1)
 
     # ── Run ───────────────────────────────────────────────────────────────────
     t0 = time.time()

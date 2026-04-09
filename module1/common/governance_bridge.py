@@ -42,6 +42,7 @@ def build_governance_engine(
     backend: str = "simulation",
     enabled: bool = True,
     strict: bool = True,
+    policy_path: Optional[str] = None,
 ):
     """
     Build and return a GovernanceEngine for Module 2 blockchain integration.
@@ -91,6 +92,8 @@ def build_governance_engine(
         expected_backend        = backend,
         require_backend_match   = strict and (backend != "simulation"),
         fail_on_commit_error    = strict,
+        require_verified_round_events = strict,
+        policy_path             = policy_path,
         output_dir              = output_dir,
     )
 

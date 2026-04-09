@@ -16,8 +16,12 @@ CC_NAME="trust-registry"
 CC_VERSION="1.2"
 # Channel is recreated by setup each run, so definition sequence must start at 1.
 CC_SEQUENCE=1
+STATE_DB="${BATFL_STATE_DB:-leveldb}"
+USE_CA="${BATFL_USE_CA:-false}"
+CONSENSUS_MODE="${BATFL_CONSENSUS:-raft}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FABRIC_ENV_OUT_FILE="${BATFL_FABRIC_ENV_OUT:-$SCRIPT_DIR/fabric_connection.env}"
 # module1/split3/hlf → module1/split3 → module1 → project root
 PROJECT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 FABRIC_SAMPLES_DIR="$PROJECT_DIR/fabric-samples"
@@ -90,21 +94,26 @@ restart_peer_container() {
 
 prepare_chaincode_source() {
     CHAINCODE_STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/batfl-chaincode.XXXXXX")"
-    rm -rf "$CHAINCODE_STAGE_DIR/$CC_NAME"
+    rm -rf "${CHAINCODE_STAGE_DIR:?}/$CC_NAME"
     cp -a "$SCRIPT_DIR/chaincode/trust_registry" "$CHAINCODE_STAGE_DIR/$CC_NAME"
     CC_SRC="$CHAINCODE_STAGE_DIR/$CC_NAME"
+    log "Preparing chaincode source and vendoring Go dependencies (this can take a few minutes)..."
     (
         cd "$CC_SRC"
-        go mod tidy
-        # Keep chaincode in module mode to reduce package size and avoid
-        # oversized vendor payloads stressing Docker socket/build paths.
-        if [ -d vendor ]; then
-            chmod -R u+w vendor 2>/dev/null || true
-            rm -rf vendor 2>/dev/null || true
-        fi
+        export GO111MODULE=on
+        # Vendor deps into chaincode package so peer-side Docker builds do not
+        # need external network/DNS access to proxy.golang.org.
         export GOPROXY=https://proxy.golang.org,direct
         export GO111MODULE=on
-        go mod download
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 300 go mod tidy || err "go mod tidy failed/timed out while preparing chaincode dependencies"
+            timeout 300 go mod download || err "go mod download failed/timed out while preparing chaincode dependencies"
+            timeout 300 go mod vendor || err "go mod vendor failed/timed out while preparing chaincode dependencies"
+        else
+            go mod tidy || err "go mod tidy failed while preparing chaincode dependencies"
+            go mod download || err "go mod download failed while preparing chaincode dependencies"
+            go mod vendor || err "go mod vendor failed while preparing chaincode dependencies"
+        fi
     )
     trap 'rm -rf "$CHAINCODE_STAGE_DIR"' EXIT
     log "Staged chaincode source at $CC_SRC"
@@ -196,12 +205,19 @@ done
 
 ./network.sh down 2>/dev/null || true
 
-echo "Running: ./network.sh up createChannel -c $CHANNEL_NAME -s leveldb"
+NETWORK_CMD=(./network.sh up createChannel -c "$CHANNEL_NAME" -s "$STATE_DB")
+if [ "$USE_CA" = "true" ]; then
+    NETWORK_CMD+=( -ca )
+fi
+if [ "$CONSENSUS_MODE" = "bft" ]; then
+    NETWORK_CMD+=( -bft )
+fi
+echo "Running: ${NETWORK_CMD[*]}"
 create_channel_with_retry() {
     local attempt=1
     local max_attempts=3
     while [ "$attempt" -le "$max_attempts" ]; do
-        if ./network.sh up createChannel -c "$CHANNEL_NAME" -s leveldb -r 10 -d 3; then
+        if "${NETWORK_CMD[@]}" -r 10 -d 3; then
             return 0
         fi
         warn "network.sh createChannel failed (attempt ${attempt}/${max_attempts}). Cleaning up and retrying..."
@@ -238,7 +254,8 @@ if [ -n "$block_file" ]; then
 fi
 
 write_connection_config() {
-    cat > "$SCRIPT_DIR/fabric_connection.env" << ENV
+    mkdir -p "$(dirname "$FABRIC_ENV_OUT_FILE")"
+    cat > "$FABRIC_ENV_OUT_FILE" << ENV
 FABRIC_CHANNEL=$CHANNEL_NAME
 FABRIC_CHAINCODE=$CC_NAME
 FABRIC_PEER_ORG1_ENDPOINT=localhost:7051
@@ -253,7 +270,7 @@ FABRIC_ORG2_KEY_DIR=$PROJECT_DIR/organizations/peerOrganizations/org2.example.co
 FABRIC_ORG2_TLS_CERT=$PROJECT_DIR/organizations/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt
 FABRIC_ORDERER_TLS_CERT=$PROJECT_DIR/organizations/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem
 ENV
-    log "Config written: $SCRIPT_DIR/fabric_connection.env"
+    log "Config written: $FABRIC_ENV_OUT_FILE"
 }
 
 write_connection_config
@@ -310,16 +327,16 @@ else
 
 if command -v go &>/dev/null; then
     cd "$CC_SRC"
-    # Keep chaincode in module mode to avoid stale vendor tree issues during Fabric builds.
+    # Rebuild vendor folder in stage dir to keep dependency tree deterministic
+    # while still allowing offline peer-side chaincode installation.
     if [ -d vendor ]; then
         chmod -R u+w vendor 2>/dev/null || true
         rm -rf vendor 2>/dev/null || true
     fi
-    # Prefer module download over vendored payloads; this keeps chaincode
-    # install artifacts smaller and avoids Docker socket stress on some hosts.
     export GOPROXY=https://proxy.golang.org,direct
     export GO111MODULE=on
     go mod download 2>&1 | tail -5 || true
+    go mod vendor 2>&1 | tail -5 || true
     cd "$PROJECT_DIR"
 else
     warn "Go not found — chaincode packaging may fail. Install: https://go.dev/dl/"
@@ -472,14 +489,14 @@ peer chaincode invoke \
     --tls --cafile "$ORDERER_CA" -C "$CHANNEL_NAME" -n "$CC_NAME" \
     --peerAddresses localhost:7051 --tlsRootCertFiles "$PEER1_TLS" \
     --peerAddresses localhost:9051 --tlsRootCertFiles "$PEER2_TLS" \
-    -c '{"function":"RegisterModel","Args":["1","abc123","blk001","GENESIS","0.85","0.92","[0,1,2]","[]","4","512"]}' 2>&1
+    -c '{"function":"AppendEvent","Args":["SMOKE","0","setup","{}"]}' 2>&1
 sleep 5
 RESULT=$(peer chaincode query -C "$CHANNEL_NAME" -n "$CC_NAME" \
-    -c '{"function":"GetModel","Args":["1"]}' 2>&1)
-if echo "$RESULT" | python3 -c "import json,sys;d=json.load(sys.stdin);assert d['round']==1" 2>/dev/null; then
+    -c '{"function":"ExportAuditTrail","Args":[]}' 2>&1)
+if echo "$RESULT" | python3 -c "import json,sys;d=json.load(sys.stdin);assert isinstance(d,list)" 2>/dev/null; then
     log "Smoke test PASSED ✅"
 else
-    warn "Smoke test inconclusive — retry in 10s: peer chaincode query -C mychannel -n trust-registry -c '{\"function\":\"GetModel\",\"Args\":[\"1\"]}'"
+    warn "Smoke test inconclusive — retry in 10s: peer chaincode query -C mychannel -n trust-registry -c '{\"function\":\"ExportAuditTrail\",\"Args\":[]}'"
 fi
 fi
 

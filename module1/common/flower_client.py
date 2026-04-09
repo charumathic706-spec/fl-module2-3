@@ -71,12 +71,27 @@ class BankFederatedClient(fl.client.Client):
         is_label_flip:    bool  = False,   # True if this client does label-flip
         flip_fraction:    float = 1.0,     # fraction of labels to flip
         attack_start_round: int = 1,       # round to start flipping
+        attack_end_round: int | None = None,
+        attack_type: str = "none",
+        attack_intensity: float = 1.0,
+        trigger_feature_count: int = 3,
+        trigger_value: float = 5.0,
+        backdoor_target_label: int = 1,
+        threshold_mode: str = "auto",
+        decision_threshold: float = 0.5,
+        threshold_beta: float = 1.5,
     ):
         self.client_id         = client_id
         self.input_dim         = X_train.shape[1]
         self.is_label_flip     = is_label_flip
         self.flip_fraction     = flip_fraction
         self.attack_start_round = attack_start_round
+        self.attack_end_round = attack_end_round
+        self.attack_type = str(attack_type).lower().strip()
+        self.attack_intensity = float(max(0.0, attack_intensity))
+        self.trigger_feature_count = int(max(1, trigger_feature_count))
+        self.trigger_value = float(trigger_value)
+        self.backdoor_target_label = int(backdoor_target_label)
         self._current_round    = 0
 
         # Optionally apply SMOTE to balance the local training set
@@ -91,7 +106,13 @@ class BankFederatedClient(fl.client.Client):
         self.n_test     = len(self.X_test)
 
         # Instantiate local model via factory
-        self.model = get_model(model_type, self.input_dim)
+        self.model = get_model(
+            model_type,
+            self.input_dim,
+            threshold_mode=threshold_mode,
+            decision_threshold=decision_threshold,
+            threshold_beta=threshold_beta,
+        )
 
         attack_tag = " [LABEL-FLIP ATTACKER]" if is_label_flip else ""
         print(
@@ -99,6 +120,62 @@ class BankFederatedClient(fl.client.Client):
             f"train={self.n_train:,} | test={self.n_test:,} | "
             f"fraud_train={int(self.y_train.sum())} ({self.y_train.mean()*100:.1f}%)"
             f"{attack_tag}"
+        )
+
+    def _is_attack_active(self) -> bool:
+        if self._current_round < self.attack_start_round:
+            return False
+        if self.attack_end_round is not None and self._current_round > self.attack_end_round:
+            return False
+        return True
+
+    def _apply_backdoor(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        X_poisoned = X.copy()
+        y_poisoned = y.copy()
+        fraction = min(1.0, max(0.0, 0.2 * self.attack_intensity))
+        n_poison = max(1, int(len(y_poisoned) * fraction))
+        idx = np.random.choice(len(y_poisoned), size=n_poison, replace=False)
+        feature_count = min(self.trigger_feature_count, X_poisoned.shape[1])
+        X_poisoned[idx, :feature_count] = X_poisoned[idx, :feature_count] + (self.trigger_value * self.attack_intensity)
+        y_poisoned[idx] = self.backdoor_target_label
+        print(
+            f"  [Attack] Bank {self.client_id:02d} BACKDOOR | "
+            f"poisoned {n_poison}/{len(y_poisoned)} | features={feature_count} | target={self.backdoor_target_label}"
+        )
+        return X_poisoned, y_poisoned
+
+    # -------------------------------------------------------------------------
+    # GET PARAMETERS — called by Flower during initialization
+    # -------------------------------------------------------------------------
+
+    def get_parameters(self, ins):
+        """Return current local model parameters for server initialization."""
+        try:
+            params = self.model.get_params()
+        except RuntimeError:
+            # Some baselines (e.g., logistic) expose params only after first fit.
+            y = self.y_train
+            idx0 = np.where(y == 0)[0]
+            idx1 = np.where(y == 1)[0]
+
+            if len(idx0) > 0 and len(idx1) > 0:
+                # Ensure bootstrap data contains both classes.
+                seed_idx = [int(idx0[0]), int(idx1[0])]
+                bootstrap_n = min(32, len(self.X_train))
+                if bootstrap_n > 2:
+                    remaining = np.random.choice(
+                        len(self.X_train), size=bootstrap_n - 2, replace=False
+                    )
+                    seed_idx.extend(int(i) for i in remaining)
+                seed_idx = np.array(seed_idx, dtype=int)
+                self.model.fit(self.X_train[seed_idx], self.y_train[seed_idx])
+            else:
+                # Fallback: initialise with full local set (single-class edge case).
+                self.model.fit(self.X_train, self.y_train)
+            params = self.model.get_params()
+        return fl.common.GetParametersRes(
+            status=fl.common.Status(code=fl.common.Code.OK, message="Success"),
+            parameters=ndarrays_to_parameters(params),
         )
 
     # -------------------------------------------------------------------------
@@ -130,10 +207,15 @@ class BankFederatedClient(fl.client.Client):
                 print(f"  [Bank {self.client_id:02d}] Note: set_params skipped ({exc})")
 
         # FIX v11: Label-flip attack — poison labels BEFORE local training
+        X_to_train = self.X_train
         y_to_train = self.y_train
-        if self.is_label_flip and self._current_round >= self.attack_start_round:
+
+        if self.attack_type == "backdoor" and self._is_attack_active():
+            X_to_train, y_to_train = self._apply_backdoor(self.X_train, self.y_train)
+
+        if self.is_label_flip and self._is_attack_active():
             y_to_train = self.y_train.copy()
-            n_flip = max(1, int(len(y_to_train) * self.flip_fraction))
+            n_flip = max(1, int(len(y_to_train) * self.flip_fraction * max(self.attack_intensity, 1e-9)))
             flip_idx = np.random.choice(len(y_to_train), size=n_flip, replace=False)
             y_to_train[flip_idx] = 1 - y_to_train[flip_idx]
             n_flipped = int((y_to_train != self.y_train).sum())
@@ -144,7 +226,7 @@ class BankFederatedClient(fl.client.Client):
             )
 
         # Local training
-        self.model.fit(self.X_train, y_to_train)
+        self.model.fit(X_to_train, y_to_train)
 
         # Evaluate on training set for logging only
         train_metrics = self.model.evaluate(self.X_train, self.y_train)  # evaluate on TRUE labels
@@ -209,8 +291,12 @@ class BankFederatedClient(fl.client.Client):
                 "client_id":          float(self.client_id),
                 "f1":                 float(metrics["f1"]),
                 "auc_roc":            float(metrics["auc_roc"]),
+                "pr_auc":             float(metrics.get("pr_auc", 0.0)),
                 "precision":          float(metrics["precision"]),
                 "recall":             float(metrics["recall"]),
+                "fraud_precision":    float(metrics.get("fraud_precision", 0.0)),
+                "fraud_recall":       float(metrics.get("fraud_recall", 0.0)),
+                "decision_threshold": float(metrics.get("decision_threshold", 0.5)),
                 "accuracy":           float(metrics["accuracy"]),
                 "balanced_accuracy":  float(metrics.get("balanced_accuracy", 0.0)),
                 "mcc":                float(metrics.get("mcc", 0.0)),
@@ -244,6 +330,15 @@ def make_client_fn(
     label_flip_clients: List[int] = None,
     flip_fraction:      float = 1.0,
     attack_start_round: int   = 1,
+    attack_end_round:   int | None = None,
+    attack_type:        str = "none",
+    attack_intensity:   float = 1.0,
+    trigger_feature_count: int = 3,
+    trigger_value:      float = 5.0,
+    backdoor_target_label: int = 1,
+    threshold_mode:     str = "auto",
+    decision_threshold: float = 0.5,
+    threshold_beta:     float = 1.5,
 ):
     """
     Returns a closure client_fn(context: Context) → BankFederatedClient.
@@ -280,6 +375,15 @@ def make_client_fn(
             is_label_flip      = cid in _flip_set,
             flip_fraction      = flip_fraction,
             attack_start_round = attack_start_round,
+            attack_end_round   = attack_end_round,
+            attack_type        = attack_type,
+            attack_intensity   = attack_intensity,
+            trigger_feature_count = trigger_feature_count,
+            trigger_value      = trigger_value,
+            backdoor_target_label = backdoor_target_label,
+            threshold_mode     = threshold_mode,
+            decision_threshold = decision_threshold,
+            threshold_beta     = threshold_beta,
         )
 
     return client_fn

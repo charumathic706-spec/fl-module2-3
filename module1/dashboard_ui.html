@@ -400,6 +400,38 @@
           <div class="bc-label">Contract Address</div>
           <div class="bc-value" id="bc-contract">n/a</div>
         </div>
+        <div class="bc-stat">
+          <div class="bc-label">Latest Verification</div>
+          <div class="bc-value" id="bc-verification">n/a</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Channel</div>
+          <div class="bc-value" id="bc-channel">n/a</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Chaincode</div>
+          <div class="bc-value" id="bc-chaincode">n/a</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Tamper Events</div>
+          <div class="bc-value" id="bc-tamper-events">0</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Hash Chain Entries</div>
+          <div class="bc-value" id="bc-hash-entries">0</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Latest Block Hash</div>
+          <div class="bc-value" id="bc-latest-block">n/a</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Fabric Peer Org1</div>
+          <div class="bc-value" id="bc-peer-org1">n/a</div>
+        </div>
+        <div class="bc-stat">
+          <div class="bc-label">Fabric Peer Org2</div>
+          <div class="bc-value" id="bc-peer-org2">n/a</div>
+        </div>
       </div>
       <div class="terminal" id="terminal-log">
         <div style="color: #6272A4; margin-bottom: 10px;">> Secure connection to Smart Contract established...</div>
@@ -433,9 +465,21 @@
           <tbody>
             <tr><td>Backend</td><td class="mono" id="impl-backend">unknown</td></tr>
             <tr><td>Chain</td><td class="mono" id="impl-chain">n/a</td></tr>
+            <tr><td>Latest Verification</td><td class="mono" id="impl-verification">n/a</td></tr>
+            <tr><td>Chain Round</td><td class="mono" id="impl-chain-round">n/a</td></tr>
+            <tr><td>Round Event Hash</td><td class="mono" id="impl-event-hash">n/a</td></tr>
+            <tr><td>Round Event Prev Hash</td><td class="mono" id="impl-event-prev-hash">n/a</td></tr>
+            <tr><td>Round Event Reason</td><td class="mono" id="impl-event-reason">n/a</td></tr>
+            <tr><td>Attestation</td><td class="mono" id="impl-attestation">n/a</td></tr>
             <tr><td>Committed</td><td class="mono" id="impl-rounds">0</td></tr>
             <tr><td>Contract</td><td class="mono" id="impl-contract">n/a</td></tr>
             <tr><td>Deploy Tx</td><td class="mono" id="impl-deploy-tx">n/a</td></tr>
+            <tr><td>Governance Source</td><td class="mono" id="impl-gov-source">n/a</td></tr>
+            <tr><td>Log Path</td><td class="mono" id="impl-log-path">n/a</td></tr>
+            <tr><td>Input Log Path</td><td class="mono" id="impl-input-log">n/a</td></tr>
+            <tr><td>Log Exists</td><td class="mono" id="impl-log-exists">n/a</td></tr>
+            <tr><td>Last Refresh Ts</td><td class="mono" id="impl-last-refresh">n/a</td></tr>
+            <tr><td>Last Success Ts</td><td class="mono" id="impl-last-success">n/a</td></tr>
             <tr><td>Log Parse Errors</td><td class="mono" id="impl-parse-errors">0</td></tr>
           </tbody>
         </table>
@@ -450,6 +494,61 @@
         </thead>
         <tbody id="impl-commit-body">
           <tr><td colspan="5" style="color: var(--text-muted);">Waiting for governance commit data...</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="glass-panel impl-card">
+      <div class="section-title" style="margin-top: 0">Security, Signing, and Contract Details</div>
+      <table class="ledger-table">
+        <thead>
+          <tr><th>Field</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Data Protection Mode</td><td class="mono" id="sec-protection">n/a</td></tr>
+          <tr><td>Attestation Algorithm</td><td class="mono" id="sec-attest-algo">n/a</td></tr>
+          <tr><td>Attestation Key ID</td><td class="mono" id="sec-attest-key">n/a</td></tr>
+          <tr><td>Attestation Signature</td><td class="mono" id="sec-attest-sig">n/a</td></tr>
+          <tr><td>Round Event Algorithm</td><td class="mono" id="sec-event-algo">n/a</td></tr>
+          <tr><td>Round Event Key ID</td><td class="mono" id="sec-event-key">n/a</td></tr>
+          <tr><td>Round Event Run ID</td><td class="mono" id="sec-run-id">n/a</td></tr>
+          <tr><td>Round Event Sequence</td><td class="mono" id="sec-event-seq">n/a</td></tr>
+          <tr><td>Round Event Hash</td><td class="mono" id="sec-event-hash">n/a</td></tr>
+          <tr><td>Round Event Prev Hash</td><td class="mono" id="sec-event-prev-hash">n/a</td></tr>
+          <tr><td>Round Event Verify Reason</td><td class="mono" id="sec-event-reason">n/a</td></tr>
+          <tr><td>Event Signature</td><td class="mono" id="sec-event-sig">n/a</td></tr>
+          <tr><td>Policy Violations</td><td class="mono" id="sec-policy-violations">none</td></tr>
+          <tr><td>Quarantined Clients</td><td class="mono" id="sec-quarantine">none</td></tr>
+          <tr><td>Latest Commit Tx</td><td class="mono" id="sec-commit-tx">n/a</td></tr>
+          <tr><td>Latest Audit Tx</td><td class="mono" id="sec-audit-tx">n/a</td></tr>
+          <tr><td>Model Hash</td><td class="mono" id="sec-model-hash">n/a</td></tr>
+          <tr><td>Latest Block Hash</td><td class="mono" id="sec-latest-block-hash">n/a</td></tr>
+          <tr><td>Hash Chain Entries</td><td class="mono" id="sec-hash-entries">0</td></tr>
+          <tr><td>Backend Evidence</td><td class="mono" id="sec-backend-evidence">n/a</td></tr>
+        </tbody>
+      </table>
+      <div style="color: var(--text-muted); font-size: 11px; margin-top: 10px;">
+        Secret keys are never shown in the dashboard. Only key IDs and signatures are displayed for auditability.
+      </div>
+    </section>
+
+    <section class="glass-panel impl-card">
+      <div class="section-title" style="margin-top: 0">Model Quality and Threshold Details</div>
+      <table class="ledger-table">
+        <thead>
+          <tr><th>Field</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Global PR-AUC</td><td class="mono" id="qual-pr-auc">0.0000</td></tr>
+          <tr><td>Best PR-AUC</td><td class="mono" id="qual-best-pr-auc">0.0000</td></tr>
+          <tr><td>Best F1</td><td class="mono" id="qual-best-f1">0.0000</td></tr>
+          <tr><td>Best AUC</td><td class="mono" id="qual-best-auc">0.0000</td></tr>
+          <tr><td>Decision Threshold</td><td class="mono" id="qual-threshold">0.000000</td></tr>
+          <tr><td>Fraud Precision</td><td class="mono" id="qual-fraud-precision">0.0000</td></tr>
+          <tr><td>Fraud Recall</td><td class="mono" id="qual-fraud-recall">0.0000</td></tr>
+          <tr><td>Balanced Accuracy</td><td class="mono" id="qual-balanced-accuracy">0.0000</td></tr>
+          <tr><td>MCC</td><td class="mono" id="qual-mcc">0.0000</td></tr>
+          <tr><td>False Positive Flags</td><td class="mono" id="qual-false-positives">0</td></tr>
         </tbody>
       </table>
     </section>
@@ -593,12 +692,19 @@ function appendBlockchainTerminal(state) {
       const blockHash = rec.block_hash || 'n/a';
       const flagged = Number(rec.flagged_count || 0);
       const trusted = Number(rec.trusted_count || 0);
+      const verified = rec.round_event_verified === undefined ? 'unknown' : (rec.round_event_verified ? 'verified' : 'rejected');
+      const reason = rec.round_event_reason || '';
+      const attestation = rec.attestation_verified === undefined ? 'n/a' : (rec.attestation_verified ? 'ok' : 'failed');
+      const keyLabel = rec.attestation_key_id || 'n/a';
+      const policyCount = Array.isArray(rec.policy_violations) ? rec.policy_violations.length : 0;
 
       const div = document.createElement('div');
       div.className = 'tx-line';
       div.innerHTML = `
         <div style="color: #FF5555; font-weight: bold;">[ROUND ${round}] Commit accepted on ${String(bc.backend || 'unknown').toUpperCase()}</div>
         <div class="tx-meta">TRUST_DECISION: trusted=${trusted} | flagged=${flagged}</div>
+        <div class="tx-meta">ROUND_EVENT: ${verified}${reason ? ' | ' + reason : ''}</div>
+        <div class="tx-meta">ATTESTATION: ${attestation} | key=${keyLabel} | policy_violations=${policyCount}</div>
         <div class="tx-meta">COMMIT_TX</div>
         <div class="tx-hash">${commitTx}</div>
         <div class="tx-meta">AUDIT_TX</div>
@@ -648,17 +754,80 @@ function updateBlockchainSummary(state) {
     : (chainIntact ? 'INTACT' : 'BROKEN');
   const committed = Number(bc.committed_rounds || 0);
   const contract = bc.contract_address || 'n/a';
+  const verification = state.round_event_verified === undefined
+    ? 'n/a'
+    : (state.round_event_verified ? 'VERIFIED' : 'REJECTED');
+  const attestationSummary = state.attestation_verified === undefined
+    ? 'n/a'
+    : `${state.attestation_verified ? 'OK' : 'FAILED'}${state.attestation_key_id ? ` | ${state.attestation_key_id}` : ''}`;
+  const policyViolations = Array.isArray(state.policy_violations) ? state.policy_violations : [];
+  const quarantinedClients = Array.isArray(state.quarantined_clients) ? state.quarantined_clients : [];
+  const protectionLabel = state.attestation_algo
+    ? `SIGNED (${state.attestation_algo})`
+    : 'SIGNED (algorithm unavailable)';
 
   document.getElementById('bc-backend').textContent = backend;
   document.getElementById('bc-chain').textContent = chainLabel;
   document.getElementById('bc-rounds').textContent = String(committed);
   document.getElementById('bc-contract').textContent = contract;
+  document.getElementById('bc-verification').textContent = verification;
+  document.getElementById('bc-channel').textContent = bc.fabric_channel || 'n/a';
+  document.getElementById('bc-chaincode').textContent = bc.fabric_chaincode || 'n/a';
+  document.getElementById('bc-tamper-events').textContent = String(Number(bc.tamper_events || 0));
+  document.getElementById('bc-hash-entries').textContent = String(Number(bc.hash_chain_entries || 0));
+  document.getElementById('bc-latest-block').textContent = bc.latest_block_hash || 'n/a';
+  document.getElementById('bc-peer-org1').textContent = bc.fabric_peer_org1 || 'n/a';
+  document.getElementById('bc-peer-org2').textContent = bc.fabric_peer_org2 || 'n/a';
 
   document.getElementById('impl-backend').textContent = backend;
   document.getElementById('impl-chain').textContent = chainLabel;
+  document.getElementById('impl-verification').textContent = verification;
+  document.getElementById('impl-chain-round').textContent = String(state.chain_round ?? state.current_round ?? 'n/a');
+  document.getElementById('impl-event-hash').textContent = state.round_event_hash || 'n/a';
+  document.getElementById('impl-event-prev-hash').textContent = state.round_event_prev_hash || 'n/a';
+  document.getElementById('impl-event-reason').textContent = state.round_event_reason || 'n/a';
+  document.getElementById('impl-attestation').textContent = attestationSummary;
   document.getElementById('impl-rounds').textContent = String(committed);
   document.getElementById('impl-contract').textContent = contract;
   document.getElementById('impl-deploy-tx').textContent = bc.deploy_tx || 'n/a';
+  document.getElementById('impl-gov-source').textContent = bc.source || 'n/a';
+  document.getElementById('impl-log-path').textContent = (state.log_status || {}).path || 'n/a';
+  document.getElementById('impl-input-log').textContent = (state.log_status || {}).input_path || 'n/a';
+  document.getElementById('impl-log-exists').textContent = String(Boolean((state.log_status || {}).exists));
+  document.getElementById('impl-last-refresh').textContent = String((state.log_status || {}).last_refresh_ts || 'n/a');
+  document.getElementById('impl-last-success').textContent = String((state.log_status || {}).last_success_ts || 'n/a');
+
+  document.getElementById('sec-protection').textContent = protectionLabel;
+  document.getElementById('sec-attest-algo').textContent = state.attestation_algo || 'n/a';
+  document.getElementById('sec-attest-key').textContent = state.attestation_key_id || 'n/a';
+  document.getElementById('sec-attest-sig').textContent = state.attestation_signature || 'n/a';
+  document.getElementById('sec-event-algo').textContent = state.round_event_algo || 'n/a';
+  document.getElementById('sec-event-key').textContent = state.round_event_key_id || 'n/a';
+  document.getElementById('sec-run-id').textContent = state.round_event_run_id || 'n/a';
+  document.getElementById('sec-event-seq').textContent = String(state.round_event_sequence || 0);
+  document.getElementById('sec-event-hash').textContent = state.round_event_hash || 'n/a';
+  document.getElementById('sec-event-prev-hash').textContent = state.round_event_prev_hash || 'n/a';
+  document.getElementById('sec-event-reason').textContent = state.round_event_reason || 'n/a';
+  document.getElementById('sec-event-sig').textContent = state.round_event_signature || 'n/a';
+  document.getElementById('sec-policy-violations').textContent = policyViolations.length ? policyViolations.join(' | ') : 'none';
+  document.getElementById('sec-quarantine').textContent = quarantinedClients.length ? quarantinedClients.join(', ') : 'none';
+  document.getElementById('sec-commit-tx').textContent = state.blockchain_tx_id || bc.latest_commit_tx || 'n/a';
+  document.getElementById('sec-audit-tx').textContent = state.audit_tx_id || bc.latest_audit_tx || 'n/a';
+  document.getElementById('sec-model-hash').textContent = state.model_hash || 'n/a';
+  document.getElementById('sec-latest-block-hash').textContent = bc.latest_block_hash || 'n/a';
+  document.getElementById('sec-hash-entries').textContent = String(Number(bc.hash_chain_entries || 0));
+  document.getElementById('sec-backend-evidence').textContent = bc.backend_reason || 'n/a';
+
+  document.getElementById('qual-pr-auc').textContent = Number(state.global_pr_auc || 0).toFixed(4);
+  document.getElementById('qual-best-pr-auc').textContent = Number(state.best_pr_auc || 0).toFixed(4);
+  document.getElementById('qual-best-f1').textContent = Number(state.best_f1 || 0).toFixed(4);
+  document.getElementById('qual-best-auc').textContent = Number(state.best_auc || 0).toFixed(4);
+  document.getElementById('qual-threshold').textContent = Number(state.global_decision_threshold || 0).toFixed(6);
+  document.getElementById('qual-fraud-precision').textContent = Number(state.global_fraud_precision || 0).toFixed(4);
+  document.getElementById('qual-fraud-recall').textContent = Number(state.global_fraud_recall || 0).toFixed(4);
+  document.getElementById('qual-balanced-accuracy').textContent = Number(state.global_balanced_accuracy || 0).toFixed(4);
+  document.getElementById('qual-mcc').textContent = Number(state.global_mcc || 0).toFixed(4);
+  document.getElementById('qual-false-positives').textContent = String(Number(state.false_positives || 0));
 
   const logStatus = state.log_status || {};
   document.getElementById('impl-parse-errors').textContent = String(logStatus.parse_errors || 0);
@@ -674,12 +843,14 @@ function updateBlockchainSummary(state) {
     .slice()
     .sort((a, b) => (b.round || 0) - (a.round || 0))
     .map((rec) => {
+      const verified = rec.round_event_verified === undefined ? 'n/a' : (rec.round_event_verified ? 'verified' : 'rejected');
+      const chainRound = rec.chain_round ?? rec.round ?? 'n/a';
       return `<tr>
         <td>${rec.round || 0}</td>
         <td class="mono">${rec.commit_tx || 'n/a'}</td>
         <td class="mono">${rec.audit_tx || 'n/a'}</td>
         <td class="mono">${rec.block_hash || 'n/a'}</td>
-        <td>${rec.flagged_count || 0}</td>
+        <td>${verified} | chain ${chainRound} | flagged ${rec.flagged_count || 0}</td>
       </tr>`;
     })
     .join('');
@@ -718,11 +889,16 @@ function applyState(state) {
   document.getElementById('last-update').textContent = 'Last sync: ' + new Date().toLocaleTimeString() + suffix;
 
   // Metrics
-  document.getElementById('cur-round').textContent = state.current_round;
-  document.getElementById('tot-rounds').textContent = state.total_rounds;
-  document.getElementById('m-f1').textContent = state.global_f1.toFixed(3);
-  document.getElementById('m-auc').textContent = state.global_auc.toFixed(3);
-  document.getElementById('m-det').textContent = state.detected_rounds + ' / ' + state.current_round;
+  const currentRound = Number(state.current_round || 0);
+  const totalRounds = Number(state.total_rounds || 0);
+  const globalF1 = Number(state.global_f1 || 0);
+  const globalAuc = Number(state.global_auc || 0);
+  const detectedRounds = Number(state.detected_rounds || 0);
+  document.getElementById('cur-round').textContent = String(currentRound);
+  document.getElementById('tot-rounds').textContent = String(totalRounds);
+  document.getElementById('m-f1').textContent = globalF1.toFixed(3);
+  document.getElementById('m-auc').textContent = globalAuc.toFixed(3);
+  document.getElementById('m-det').textContent = detectedRounds + ' / ' + currentRound;
 
   renderClientCards(state);
   
