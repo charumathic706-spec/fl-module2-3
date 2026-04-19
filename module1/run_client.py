@@ -54,6 +54,7 @@ import argparse
 import os
 import sys
 import time
+from typing import Dict, Any
 
 # Path setup — add module1/ root so all common.* imports work
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +64,33 @@ if _ROOT not in sys.path:
 from common.flower_client  import BankFederatedClient
 from common.data_partition import load_dataset, dirichlet_partition, load_partition
 import flwr as fl
+
+
+def _read_bytes(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _build_tls_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
+    """Build Flower start_client TLS kwargs from CLI options."""
+    tls_kwargs: Dict[str, Any] = {}
+
+    if args.root_ca:
+        tls_kwargs["root_certificates"] = _read_bytes(args.root_ca)
+
+    cert = _read_bytes(args.client_cert)
+    key = _read_bytes(args.client_key)
+    if cert and key:
+        tls_kwargs["certificates"] = (cert, key)
+    elif cert or key:
+        raise ValueError("Both --client_cert and --client_key are required for mTLS")
+
+    if args.require_tls and not args.root_ca:
+        raise ValueError("--require_tls requires --root_ca")
+
+    return tls_kwargs
 
 
 def build_parser():
@@ -104,6 +132,14 @@ EXAMPLES
                    help="Enable label-flip attack on this client")
     p.add_argument("--retry",       type=int,   default=60,
                    help="Seconds to retry connecting (default: 60)")
+    p.add_argument("--require_tls", action="store_true",
+                   help="Require TLS connection (fails if TLS options are missing/unsupported)")
+    p.add_argument("--root_ca", type=str, default=None,
+                   help="Path to CA certificate PEM for server TLS verification")
+    p.add_argument("--client_cert", type=str, default=None,
+                   help="Path to client certificate PEM (optional, for mutual TLS)")
+    p.add_argument("--client_key", type=str, default=None,
+                   help="Path to client private key PEM (optional, for mutual TLS)")
     return p
 
 
@@ -199,12 +235,34 @@ def main():
     print(f"\n[Client {args.cid}] Connecting to {args.server} "
           f"(will retry up to {args.retry}s) ...\n")
 
+    tls_kwargs = _build_tls_kwargs(args)
+    using_tls = bool(tls_kwargs.get("root_certificates"))
+    if using_tls:
+        mtls = "yes" if "certificates" in tls_kwargs else "no"
+        print(f"[Client {args.cid}] TLS enabled | mTLS={mtls}")
+    elif args.require_tls:
+        print(f"[Client {args.cid}] TLS required but not configured.")
+        sys.exit(1)
+
     for attempt in range(args.retry):
         try:
-            fl.client.start_client(
-                server_address = args.server,
-                client         = client.to_client(),
-            )
+            try:
+                fl.client.start_client(
+                    server_address = args.server,
+                    client         = client.to_client(),
+                    **tls_kwargs,
+                )
+            except TypeError as exc:
+                if tls_kwargs:
+                    if args.require_tls:
+                        raise RuntimeError(
+                            "Installed Flower version does not support TLS kwargs for start_client"
+                        ) from exc
+                    print(f"  [Client {args.cid}] TLS options unsupported by Flower build; retrying without TLS")
+                fl.client.start_client(
+                    server_address = args.server,
+                    client         = client.to_client(),
+                )
             print(f"\n[Client {args.cid}] All rounds complete. Disconnected cleanly.")
             break
         except Exception as exc:

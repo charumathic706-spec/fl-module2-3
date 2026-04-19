@@ -38,12 +38,33 @@ GANACHE_URL  = "http://127.0.0.1:8545"
 _THIS_DIR    = os.path.dirname(os.path.abspath(__file__))
 _DEPLOY_FILE = os.path.join(_THIS_DIR, "eth_deployment.json")
 
-# ModelRegistry.sol — look in several candidate locations
-_SOL_CANDIDATES = [
-    os.path.join(_THIS_DIR, "contracts", "ModelRegistry.sol"),
-    os.path.join(_THIS_DIR, "..", "contracts", "ModelRegistry.sol"),
-    os.path.join(_THIS_DIR, "..", "split3", "contracts", "ModelRegistry.sol"),
-]
+def _sol_candidates() -> List[str]:
+    """Build candidate paths for ModelRegistry.sol across local and packaged runs."""
+    candidates = [
+        os.path.join(_THIS_DIR, "contracts", "ModelRegistry.sol"),
+        os.path.join(_THIS_DIR, "..", "contracts", "ModelRegistry.sol"),
+        os.path.join(_THIS_DIR, "..", "split3", "contracts", "ModelRegistry.sol"),
+    ]
+
+    project_root = os.getenv("BATFL_PROJECT_ROOT", "").strip()
+    if project_root:
+        candidates.append(
+            os.path.join(project_root, "module1", "split3", "contracts", "ModelRegistry.sol")
+        )
+
+    cwd = os.getcwd()
+    candidates.append(os.path.join(cwd, "module1", "split3", "contracts", "ModelRegistry.sol"))
+    candidates.append(os.path.join(cwd, "split3", "contracts", "ModelRegistry.sol"))
+
+    # De-duplicate while preserving order.
+    deduped: List[str] = []
+    seen = set()
+    for p in candidates:
+        norm = os.path.normpath(p)
+        if norm not in seen:
+            deduped.append(norm)
+            seen.add(norm)
+    return deduped
 
 
 # =============================================================================
@@ -64,7 +85,8 @@ def _compile() -> Tuple[str, list]:
         print("[Ethereum] Installing Solidity 0.8.19 compiler (one time)...")
         install_solc("0.8.19", show_progress=True)
 
-    sol_path = next((p for p in _SOL_CANDIDATES if os.path.exists(p)), None)
+    candidates = _sol_candidates()
+    sol_path = next((p for p in candidates if os.path.exists(p)), None)
     if sol_path:
         print(f"[Ethereum] Compiling {sol_path}")
         with open(sol_path, encoding="utf-8") as f:
@@ -72,7 +94,7 @@ def _compile() -> Tuple[str, list]:
     else:
         raise FileNotFoundError(
             "ModelRegistry.sol not found.\n"
-            f"Searched: {_SOL_CANDIDATES}"
+            f"Searched: {candidates}"
         )
 
     compiled  = compile_source(source, output_values=["abi", "bin"],
@@ -282,7 +304,7 @@ class EthBlockchainGateway:
             f1_int, auc_int, trusted, flagged,
         )
         if ok:
-            print(f"  [Ethereum] Round {round_num:02d} → block | "
+            print(f"  [Ethereum] Round {round_num:02d} committed to block | "
                   f"tx={tx[:20]}... | F1={global_f1:.4f}")
         else:
             print(f"  [Ethereum] WARNING: Round {round_num} registration FAILED")

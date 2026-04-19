@@ -33,9 +33,11 @@ from typing import Dict, List
 try:
     from module1.common.local_models import get_model
     from module1.common.data_partition import apply_smote
+    from module1.common.model_hashing import hash_model_parameters_canonical
 except ImportError:
     from common.local_models import get_model
     from common.data_partition import apply_smote
+    from common.model_hashing import hash_model_parameters_canonical
 
 
 # =============================================================================
@@ -80,6 +82,7 @@ class BankFederatedClient(fl.client.Client):
         threshold_mode: str = "auto",
         decision_threshold: float = 0.5,
         threshold_beta: float = 1.5,
+        enforce_model_integrity: bool = True,
     ):
         self.client_id         = client_id
         self.input_dim         = X_train.shape[1]
@@ -93,6 +96,8 @@ class BankFederatedClient(fl.client.Client):
         self.trigger_value = float(trigger_value)
         self.backdoor_target_label = int(backdoor_target_label)
         self._current_round    = 0
+        self.enforce_model_integrity = bool(enforce_model_integrity)
+        self.last_verified_model_hash: str = ""
 
         # Optionally apply SMOTE to balance the local training set
         if use_smote:
@@ -120,6 +125,44 @@ class BankFederatedClient(fl.client.Client):
             f"train={self.n_train:,} | test={self.n_test:,} | "
             f"fraud_train={int(self.y_train.sum())} ({self.y_train.mean()*100:.1f}%)"
             f"{attack_tag}"
+        )
+
+    def _verify_received_global_model(self, params: List[np.ndarray], config: Dict[str, object], phase: str) -> None:
+        """Verify model integrity before loading global parameters locally."""
+        if not params:
+            return
+
+        expected_hash = str(config.get("expected_model_hash", "") or "").strip()
+        verification_required = bool(config.get("require_model_hash_verification", False))
+        if self.enforce_model_integrity and bool(expected_hash):
+            verification_required = True
+
+        if not expected_hash:
+            if verification_required:
+                raise RuntimeError(
+                    f"Missing expected_model_hash in {phase} config for client {self.client_id}"
+                )
+            return
+
+        if len(expected_hash) != 64:
+            raise RuntimeError(
+                f"Invalid expected_model_hash length in {phase} config for client {self.client_id}: {len(expected_hash)}"
+            )
+
+        actual_hash, _, _ = hash_model_parameters_canonical(params)
+        if actual_hash != expected_hash:
+            chain_round = int(config.get("expected_chain_round", 0) or 0)
+            tx_id = str(config.get("expected_commit_tx", "") or "")
+            raise RuntimeError(
+                "Global model integrity verification failed "
+                f"(client={self.client_id}, phase={phase}, round={self._current_round}, "
+                f"chain_round={chain_round}, expected={expected_hash[:12]}..., actual={actual_hash[:12]}..., tx={tx_id})"
+            )
+
+        self.last_verified_model_hash = actual_hash
+        print(
+            f"  [Bank {self.client_id:02d}] Integrity OK ({phase}) | "
+            f"hash={actual_hash[:16]}..."
         )
 
     def _is_attack_active(self) -> bool:
@@ -201,6 +244,7 @@ class BankFederatedClient(fl.client.Client):
         # Load global model weights into local model
         global_params = parameters_to_ndarrays(ins.parameters)
         if global_params:
+            self._verify_received_global_model(global_params, dict(ins.config or {}), phase="fit")
             try:
                 self.model.set_params(global_params)
             except Exception as exc:
@@ -263,6 +307,7 @@ class BankFederatedClient(fl.client.Client):
 
         global_params = parameters_to_ndarrays(ins.parameters)
         if global_params:
+            self._verify_received_global_model(global_params, dict(ins.config or {}), phase="evaluate")
             try:
                 self.model.set_params(global_params)
             except Exception as exc:

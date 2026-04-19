@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Dict, Any
 
 import numpy as np
 import matplotlib
@@ -77,6 +77,37 @@ except ImportError:
     from common.experiment_tracking import write_run_manifest, write_baseline_comparison_report, summarize_run
 
 SERVER_ADDRESS = "127.0.0.1:8081"
+
+
+def _read_bytes(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _build_tls_kwargs(
+    require_tls: bool,
+    root_ca: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+
+    if root_ca:
+        kwargs["root_certificates"] = _read_bytes(root_ca)
+
+    cert = _read_bytes(client_cert)
+    key = _read_bytes(client_key)
+    if cert and key:
+        kwargs["certificates"] = (cert, key)
+    elif cert or key:
+        raise ValueError("Both client certificate and key are required for mTLS")
+
+    if require_tls and not root_ca:
+        raise ValueError("TLS is required but root CA path is missing")
+
+    return kwargs
 
 
 def _to_bool_env(value: str, default: bool) -> bool:
@@ -129,7 +160,8 @@ def _ensure_fabric_ready() -> None:
             # BFT profile has additional orderers (orderer2/3/4).
             if "orderer2.example.com" in names or "orderer3.example.com" in names or "orderer4.example.com" in names:
                 return "bft"
-        except Exception:
+        except Exception as exc:
+            print(f"[Main] Fabric consensus probe failed ({exc}); defaulting to RAFT.")
             pass
         return "raft"
 
@@ -307,10 +339,35 @@ def _run_as_client(cid, cache, model_type, use_smote, server_address,
         threshold_beta     = threshold_beta,
     )
 
+    require_tls = _to_bool_env(os.getenv("BATFL_REQUIRE_TLS"), False)
+    root_ca = os.getenv("BATFL_TLS_ROOT_CA", "").strip() or None
+    client_cert = os.getenv("BATFL_TLS_CLIENT_CERT", "").strip() or None
+    client_key = os.getenv("BATFL_TLS_CLIENT_KEY", "").strip() or None
+
+    tls_kwargs = _build_tls_kwargs(
+        require_tls=require_tls,
+        root_ca=root_ca,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
+
     max_attempts = 90
     for attempt in range(max_attempts):
         try:
-            fl.client.start_client(server_address=server_address, client=client.to_client())
+            try:
+                fl.client.start_client(
+                    server_address=server_address,
+                    client=client.to_client(),
+                    **tls_kwargs,
+                )
+            except TypeError as exc:
+                if tls_kwargs:
+                    if require_tls:
+                        raise RuntimeError(
+                            "Installed Flower version does not support TLS kwargs for start_client"
+                        ) from exc
+                    print(f"  [Bank {cid:02d}] TLS kwargs unsupported; retrying without TLS")
+                fl.client.start_client(server_address=server_address, client=client.to_client())
             break
         except Exception as exc:
             if attempt < max_attempts - 1:
@@ -387,8 +444,20 @@ def build_parser():
                    help="Disable Module 2 entirely (Module 1 only mode)")
     p.add_argument("--governance_policy", type=str, default=None,
                    help="Path to governance policy JSON/YAML file")
+    p.add_argument("--privacy_policy", type=str, default=None,
+                   help="Path to privacy policy JSON/YAML file")
+    p.add_argument("--enforce_privacy_policy", action="store_true",
+                   help="Fail run when privacy policy violations are detected")
     p.add_argument("--event_storage", type=str, default="jsonl", choices=["jsonl", "sqlite"],
                    help="Round event storage backend")
+    p.add_argument("--require_tls", action="store_true",
+                   help="Require TLS for external client gRPC transport (network mode)")
+    p.add_argument("--tls_root_ca", type=str, default=None,
+                   help="CA certificate PEM path for server verification (network mode)")
+    p.add_argument("--tls_client_cert", type=str, default=None,
+                   help="Client certificate PEM path (optional mTLS, network mode)")
+    p.add_argument("--tls_client_key", type=str, default=None,
+                   help="Client private key PEM path (optional mTLS, network mode)")
 
     # Hidden subprocess flags
     p.add_argument("--_client_mode",   action="store_true",  help=argparse.SUPPRESS)
@@ -456,6 +525,15 @@ def main():
     server_address = f"127.0.0.1:{args.port}"
     os.makedirs(args.log_dir, exist_ok=True)
 
+    if args.require_tls:
+        os.environ["BATFL_REQUIRE_TLS"] = "true"
+    if args.tls_root_ca:
+        os.environ["BATFL_TLS_ROOT_CA"] = str(args.tls_root_ca)
+    if args.tls_client_cert:
+        os.environ["BATFL_TLS_CLIENT_CERT"] = str(args.tls_client_cert)
+    if args.tls_client_key:
+        os.environ["BATFL_TLS_CLIENT_KEY"] = str(args.tls_client_key)
+
     sep = "=" * 65
     print(f"\n{sep}")
     print("  SPLIT 2 — TRUST-WEIGHTED FEDERATED LEARNING")
@@ -515,6 +593,8 @@ def main():
             enabled   = True,
             strict    = True,
             policy_path = args.governance_policy,
+            privacy_policy_path = args.privacy_policy,
+            enforce_privacy_policy = args.enforce_privacy_policy,
         )
 
     # ── Step 3: Load data ─────────────────────────────────────────────────────

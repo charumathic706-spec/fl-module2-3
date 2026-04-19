@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import time
 import subprocess
@@ -199,6 +200,10 @@ class HLFGateway:
     def raise_tamper_alert(self, round_num, alert_type, detail, severity="HIGH"):
         tx_id, ok = self._submit("RaiseTamperAlert",
                                   [str(round_num), alert_type, detail, severity])
+        if not ok:
+            raise RuntimeError(
+                f"[HLF] Tamper alert transaction failed for round {round_num}: {tx_id}"
+            )
         return tx_id, {"alert_type": alert_type, "round": round_num, "tx_id": tx_id}
 
     def get_tamper_alerts(self):
@@ -208,8 +213,12 @@ class HLFGateway:
 
     # ── Audit Log ─────────────────────────────────────────────────────────────
     def append_audit_event(self, event_type, round_num, data, actor="FederatedCoordinator"):
-        tx_id, _ = self._submit("AppendEvent",
+        tx_id, ok = self._submit("AppendEvent",
                                  [event_type, str(round_num), actor, json.dumps(data)])
+        if not ok:
+            raise RuntimeError(
+                f"[HLF] Audit event transaction failed for round {round_num}: {tx_id}"
+            )
         return tx_id
 
     def get_audit_trail(self):
@@ -221,8 +230,8 @@ class HLFGateway:
     def get_block_count(self):
         try:
             return len(self.get_all_model_records())
-        except Exception:
-            return -1
+        except Exception as exc:
+            raise RuntimeError(f"[HLF] Unable to read block count: {exc}") from exc
 
     def verify_ledger(self):
         try:
@@ -285,7 +294,12 @@ class HLFGateway:
                 )
                 output = (result.stdout or "") + (result.stderr or "")
                 if result.returncode == 0:
-                    tx_id = self._derive_tx_id(fn, args, output)
+                    tx_id = self._extract_fabric_tx_id(output)
+                    if not tx_id:
+                        logger.warning(
+                            f"[HLF] Submit {fn} succeeded but no transaction ID was parsed from peer output."
+                        )
+                        tx_id = "UNKNOWN_TX_ID"
                     return tx_id, True
 
                 msg = (result.stderr or result.stdout or "").strip()
@@ -364,10 +378,20 @@ class HLFGateway:
         return json.dumps(payload, separators=(",", ":"))
 
     @staticmethod
-    def _derive_tx_id(fn: str, args: List[str], output: str) -> str:
-        import hashlib
-        raw = json.dumps({"fn": fn, "args": args, "output": output}, sort_keys=True)
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+    def _extract_fabric_tx_id(output: str) -> str:
+        if not output:
+            return ""
+
+        patterns = [
+            r"txid\s*[:=\[]\s*([0-9a-fA-F]{64})",
+            r"transaction\s+id\s*[:=]\s*([0-9a-fA-F]{64})",
+            r"\b([0-9a-fA-F]{64})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, output, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return ""
 
     @staticmethod
     def _wsl_path(path_text: str) -> str:

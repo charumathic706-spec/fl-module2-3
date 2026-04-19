@@ -115,6 +115,10 @@ def parse_args():
     p.add_argument("--verify_every",       type=int,   default=5)
     p.add_argument("--policy", type=str, default=None,
                    help="Path to governance policy JSON/YAML")
+    p.add_argument("--privacy_policy", type=str, default=None,
+                   help="Path to privacy policy JSON/YAML")
+    p.add_argument("--enforce_privacy_policy", action="store_true",
+                   help="Fail run when privacy policy violations are detected")
     p.add_argument("--audit_chain", action="store_true",
                    help="Read-only audit from blockchain attestations (ignores trust_log)")
     p.add_argument("--allow_unsigned_events", action="store_true",
@@ -143,6 +147,8 @@ def main():
         fail_on_commit_error   = True,
         require_verified_round_events = (not args.allow_unsigned_events and not args.demo),
         policy_path            = args.policy,
+        privacy_policy_path    = args.privacy_policy,
+        enforce_privacy_policy = args.enforce_privacy_policy,
         output_dir             = args.output_dir,
     )
 

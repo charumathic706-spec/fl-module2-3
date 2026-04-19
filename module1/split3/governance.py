@@ -78,6 +78,9 @@ class GovernanceConfig:
     fail_on_commit_error:      bool  = True
     require_verified_round_events: bool = True
     policy_path:               Optional[str] = None
+    privacy_policy_path:       Optional[str] = None
+    enforce_privacy_policy:    bool  = False
+    access_audit_enabled:      bool  = True
 
     # Audit trail actor label
     audit_actor:               str   = "FederatedCoordinator"
@@ -86,6 +89,7 @@ class GovernanceConfig:
     output_dir:                str   = "./governance_output"
     report_filename:           str   = "governance_report.json"
     hash_chain_filename:       str   = "hash_chain.json"
+    privacy_report_filename:   str   = "privacy_report.json"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -115,6 +119,7 @@ class RoundGovernanceRecord:
     attestation_algo:     str = ""
     attestation_signature: str = ""
     policy_violations:    List[str] = field(default_factory=list)
+    privacy_violations:   List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
@@ -139,6 +144,7 @@ class RoundGovernanceRecord:
             "attestation_algo":     self.attestation_algo,
             "attestation_signature": self.attestation_signature,
             "policy_violations": self.policy_violations,
+            "privacy_violations": self.privacy_violations,
         }
 
 
@@ -222,6 +228,7 @@ class GovernanceEngine:
         self._blockchain_round_offset: int          = self._compute_blockchain_round_offset()
         self._seed_hasher_from_blockchain()
         self._policy:                Dict[str, Any] = self._load_policy(self.cfg.policy_path)
+        self._privacy_policy:        Dict[str, Any] = self._load_privacy_policy(self.cfg.privacy_policy_path)
         self._attest_algo:           str            = str(os.getenv("BATFL_ATTESTATION_ALGO", "HMAC-SHA256")).strip().upper()
         self._attest_key_id:         str            = str(os.getenv("BATFL_ATTESTATION_KEY_ID", "coordinator-default")).strip()
         self._attest_hmac_keys:      Dict[str, bytes] = self._load_hmac_attestation_keys()
@@ -240,6 +247,8 @@ class GovernanceEngine:
         print(f"  Attest:    {self._attest_algo} (active key_id={self._attest_key_id})")
         if self.cfg.policy_path:
             print(f"  Policy:    {self.cfg.policy_path}")
+        if self.cfg.privacy_policy_path:
+            print(f"  Privacy:   {self.cfg.privacy_policy_path} (enforce={self.cfg.enforce_privacy_policy})")
         if self._blockchain_round_offset > 0:
             print(f"  Chain offset: on-chain rounds already exist (offset={self._blockchain_round_offset})")
 
@@ -261,7 +270,7 @@ class GovernanceEngine:
             trust_log = json.load(f)
 
         print(f"  Rounds to process: {len(trust_log)}")
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
 
         for entry in trust_log:
             self.process_round(entry)
@@ -303,6 +312,16 @@ class GovernanceEngine:
             global_f1=float(global_f1),
             global_auc=float(global_auc),
         )
+        privacy_violations = self._evaluate_round_privacy(
+            round_num=rnd,
+            log_entry=log_entry,
+            trusted=trusted,
+            flagged=flagged,
+        )
+        if self.cfg.enforce_privacy_policy and privacy_violations:
+            raise RuntimeError(
+                f"Privacy policy violation at round {rnd}: {privacy_violations}"
+            )
 
         # 1. Build hash chain entry from Split 2's logged model hash.
         #    This preserves end-to-end model identity from training to governance.
@@ -327,7 +346,7 @@ class GovernanceEngine:
         )
         quarantined_now = list(self._quarantined_clients)
 
-        # 3. Build signed attestation payload and commit it on-chain first.
+        # 3. Build signed attestation payload.
         attestation_payload = self._build_attestation_payload(
             round_num=rnd,
             model_hash=hash_record.model_hash,
@@ -357,14 +376,7 @@ class GovernanceEngine:
             attestation_payload["signature_verified"] = True
             attestation_verified = True
 
-        attestation_tx = self.gateway.append_audit_event(
-            event_type="ROUND_ATTESTED",
-            round_num=chain_rnd,
-            data=attestation_payload,
-            actor=self.cfg.audit_actor,
-        )
-
-        # 4. Register on blockchain model registry
+        # 4. Register on blockchain model registry first.
         tx_id, ok = self.gateway.register_model(
             round_num=chain_rnd,
             model_hash=hash_record.model_hash,
@@ -383,7 +395,15 @@ class GovernanceEngine:
                 "Stopping to preserve governance integrity."
             )
 
-        # 5. Periodic chain verification
+        # 5. Record attestation after the model commit succeeds.
+        attestation_tx = self.gateway.append_audit_event(
+            event_type="ROUND_ATTESTED",
+            round_num=chain_rnd,
+            data=attestation_payload,
+            actor=self.cfg.audit_actor,
+        )
+
+        # 6. Periodic chain verification
         tamper_alerts: List[str] = []
         chain_intact = True
         if rnd % self.cfg.verify_chain_every_n == 0 or rnd == 1:
@@ -401,7 +421,7 @@ class GovernanceEngine:
                         severity="CRITICAL",
                     )
 
-        # 6. Raise alerts for newly quarantined clients
+        # 7. Raise alerts for newly quarantined clients
         for cid in newly_quarantined:
             alert_msg = (f"CLIENT_QUARANTINED: client {cid} "
                          f"flagged {self.cfg.consecutive_flag_limit} consecutive rounds")
@@ -413,7 +433,7 @@ class GovernanceEngine:
                 severity="HIGH",
             )
 
-        # 7. Audit trail event
+        # 8. Audit trail event
         audit_tx = self.gateway.append_audit_event(
             event_type="ROUND_COMMITTED",
             round_num=chain_rnd,
@@ -432,6 +452,7 @@ class GovernanceEngine:
                 "flagged_clients":     flagged,
                 "quarantined_clients": quarantined_now,
                 "policy_violations":   policy_violations,
+                "privacy_violations":  privacy_violations,
                 "chain_intact":        chain_intact,
             },
             actor=self.cfg.audit_actor,
@@ -463,6 +484,7 @@ class GovernanceEngine:
             attestation_algo=str(attestation_payload["attestation_algo"]),
             attestation_signature=str(attestation_payload["attestation_signature"]),
             policy_violations=policy_violations,
+            privacy_violations=privacy_violations,
         )
         self._round_records.append(record)
         self._last_global_auc = float(global_auc)
@@ -588,6 +610,13 @@ class GovernanceEngine:
         Read attestation + model commit from blockchain and independently verify
         attestation signature and model-hash consistency.
         """
+        self._append_access_audit(
+            event_type="ROUND_ATTESTATION_READ",
+            round_num=int(round_num),
+            data={"round": int(round_num)},
+            actor="GovernanceReader",
+        )
+
         model_record = None
         if hasattr(self.gateway, "get_model_record"):
             model_record = self.gateway.get_model_record(round_num)
@@ -681,13 +710,25 @@ class GovernanceEngine:
         results = [self.verify_round_from_blockchain(rnd) for rnd in rounds]
         verified = [r for r in results if r.get("verified")]
         failed = [r for r in results if not r.get("verified")]
-        return {
+        summary = {
             "round_count": len(rounds),
             "verified_count": len(verified),
             "failed_count": len(failed),
             "all_verified": len(failed) == 0,
             "results": results,
         }
+        self._append_access_audit(
+            event_type="BLOCKCHAIN_ATTESTATION_AUDIT",
+            round_num=0,
+            data={
+                "round_count": summary["round_count"],
+                "verified_count": summary["verified_count"],
+                "failed_count": summary["failed_count"],
+                "all_verified": summary["all_verified"],
+            },
+            actor="GovernanceReader",
+        )
+        return summary
 
     def run_tamper_simulation(
         self,
@@ -697,7 +738,7 @@ class GovernanceEngine:
         Inject a simulated tamper into the hash chain and verify detection.
         Returns a dict describing the tamper event and detection result.
         """
-        print(f"\n[Governance] 🔬 Tamper simulation — injecting at round {round_to_tamper}")
+        print(f"\n[Governance] Tamper simulation - injecting at round {round_to_tamper}")
 
         if not self.hasher.get_chain():
             return {"error": "No hash chain built yet. Run process_trust_log() first."}
@@ -717,7 +758,7 @@ class GovernanceEngine:
             "detection_message":   report.summary(),
         }
 
-        print(f"  Tamper {'DETECTED ✅' if detected else 'MISSED ❌'}")
+        print(f"  Tamper {'DETECTED' if detected else 'MISSED'}")
         print(f"  {report.summary()}")
 
         # Log tamper simulation to audit trail
@@ -740,7 +781,8 @@ class GovernanceEngine:
         report = self._build_report()
 
         report_path = os.path.join(self.cfg.output_dir, self.cfg.report_filename)
-        chain_path  = os.path.join(self.cfg.output_dir, self.cfg.hash_chain_filename)
+        chain_path = os.path.join(self.cfg.output_dir, self.cfg.hash_chain_filename)
+        privacy_path = os.path.join(self.cfg.output_dir, self.cfg.privacy_report_filename)
 
         with open(report_path, "w") as f:
             json.dump(report.to_dict(), f, indent=2, default=str)
@@ -748,9 +790,25 @@ class GovernanceEngine:
         with open(chain_path, "w") as f:
             json.dump(self.hasher.export_chain(), f, indent=2)
 
+        with open(privacy_path, "w") as f:
+            json.dump(self._build_privacy_report(), f, indent=2, default=str)
+
+        self._append_access_audit(
+            event_type="REPORT_EXPORTED",
+            round_num=0,
+            data={
+                "report_file": os.path.basename(report_path),
+                "chain_file": os.path.basename(chain_path),
+                "privacy_file": os.path.basename(privacy_path),
+                "total_rounds": len(self._round_records),
+            },
+            actor=self.cfg.audit_actor,
+        )
+
         print(f"\n[Governance] Reports written:")
-        print(f"  → {report_path}")
-        print(f"  → {chain_path}")
+        print(f"  report: {report_path}")
+        print(f"  chain : {chain_path}")
+        print(f"  privacy: {privacy_path}")
         return report_path, chain_path
 
     def print_summary(self) -> None:
@@ -761,11 +819,15 @@ class GovernanceEngine:
         print(f"{'='*65}")
         print(f"  Rounds processed:    {report.total_rounds}")
         print(f"  Backend:             {report.backend_used} ({report.backend_source})")
-        print(f"  Hash chain intact:   {'✅ YES' if report.chain_intact else '🚨 BROKEN'}")
+        print(f"  Hash chain intact:   {'YES' if report.chain_intact else 'BROKEN'}")
         print(f"  Tamper events:       {report.tamper_events}")
         print(f"  Quarantined clients: {report.quarantined_clients}")
         print(f"  Best Global F1:      {report.best_f1:.4f} (Round {report.best_round})")
-        print(f"\n  Blockchain blocks:   {self.gateway.get_block_count()}")
+        try:
+            block_count = self.gateway.get_block_count()
+            print(f"\n  Blockchain blocks:   {block_count}")
+        except Exception as exc:
+            print(f"\n  Blockchain blocks:   unavailable ({exc})")
         alerts = self.gateway.get_tamper_alerts()
         print(f"  On-chain alerts:     {len(alerts)}")
         audit  = self.gateway.get_audit_trail()
@@ -803,7 +865,7 @@ class GovernanceEngine:
                     cid not in self._quarantined_clients):
                 self._quarantined_clients.add(cid)
                 newly_quarantined.append(cid)
-                print(f"    ⚠️  Client {cid} QUARANTINED after "
+                print(f"    WARNING: Client {cid} quarantined after "
                       f"{count} consecutive flagged rounds")
 
         quarantine_policy = self._policy.get("quarantine", {})
@@ -815,7 +877,7 @@ class GovernanceEngine:
                 self._quarantined_clients.add(cid)
                 newly_quarantined.append(cid)
                 print(
-                    f"    ⚠️  Client {cid} QUARANTINED by policy violation "
+                    f"    WARNING: Client {cid} quarantined by policy violation "
                     f"(round {rnd}, violations={len(policy_violations)})"
                 )
 
@@ -871,6 +933,42 @@ class GovernanceEngine:
 
         return violations
 
+    def _evaluate_round_privacy(
+        self,
+        round_num: int,
+        log_entry: Dict[str, Any],
+        trusted: List[int],
+        flagged: List[int],
+    ) -> List[str]:
+        """Evaluate optional privacy policy controls for the current round."""
+        violations: List[str] = []
+        policy = self._privacy_policy
+
+        runtime_cfg = policy.get("runtime", {}) or {}
+        if not bool(runtime_cfg.get("enabled", True)):
+            return violations
+
+        req = policy.get("round_requirements", {}) or {}
+        min_clients = int(req.get("min_clients_per_round", 0))
+        participants = len(set(int(c) for c in (trusted or [])) | set(int(c) for c in (flagged or [])))
+        if participants < min_clients:
+            violations.append(f"min_clients_per_round violation: {participants} < {min_clients}")
+
+        max_flagged_ratio = float(req.get("max_flagged_ratio", 1.0))
+        ratio = (float(len(flagged)) / float(participants)) if participants > 0 else 0.0
+        if ratio > max_flagged_ratio:
+            violations.append(f"max_flagged_ratio violation: {ratio:.6f} > {max_flagged_ratio:.6f}")
+
+        logging_cfg = policy.get("logging", {}) or {}
+        require_signed_events = bool(logging_cfg.get("require_signed_round_events", self.cfg.require_verified_round_events))
+        if require_signed_events and not isinstance(log_entry.get("round_event"), dict):
+            violations.append("require_signed_round_events violation: round_event missing")
+
+        if violations:
+            print(f"    [Privacy] Round {round_num} violations: {violations}")
+
+        return violations
+
     def _finalise(self) -> GovernanceReport:
         """Called after processing all rounds to produce the final report."""
         self.print_summary()
@@ -891,6 +989,42 @@ class GovernanceEngine:
             round_records=self._round_records,
             tamper_report=tamper_report_raw.__dict__,
         )
+
+    def _build_privacy_report(self) -> Dict[str, Any]:
+        rounds_with_violations = []
+        total_violations = 0
+        for rec in self._round_records:
+            if rec.privacy_violations:
+                rounds_with_violations.append(
+                    {
+                        "round": int(rec.round_num),
+                        "privacy_violations": list(rec.privacy_violations),
+                    }
+                )
+                total_violations += len(rec.privacy_violations)
+
+        logging_cfg = self._privacy_policy.get("logging", {}) or {}
+        include_full_policy = bool(logging_cfg.get("include_policy_in_report", True))
+        policy_snapshot: Dict[str, Any] = self._privacy_policy if include_full_policy else {
+            "version": self._privacy_policy.get("version", "batfl.privacy-policy.v1"),
+            "digest_sha256": self._policy_digest(self._privacy_policy),
+        }
+
+        return {
+            "schema": "batfl.privacy-report.v1",
+            "generated_at": time.time(),
+            "backend": self._active_backend,
+            "policy_path": self.cfg.privacy_policy_path,
+            "enforce_mode": bool(self.cfg.enforce_privacy_policy),
+            "policy": policy_snapshot,
+            "summary": {
+                "total_rounds": len(self._round_records),
+                "rounds_with_violations": len(rounds_with_violations),
+                "total_privacy_violations": total_violations,
+                "all_rounds_compliant": len(rounds_with_violations) == 0,
+            },
+            "round_violations": rounds_with_violations,
+        }
 
     def _detect_active_backend(self) -> str:
         """Infer active gateway backend from concrete gateway class name."""
@@ -965,6 +1099,53 @@ class GovernanceEngine:
         self.cfg.min_f1_threshold = float(
             policy["round_requirements"].get("min_global_f1", self.cfg.min_f1_threshold)
         )
+        return policy
+
+    def _load_privacy_policy(self, policy_path: Optional[str]) -> Dict[str, Any]:
+        policy = {
+            "version": "batfl.privacy-policy.v1",
+            "runtime": {
+                "enabled": True,
+            },
+            "round_requirements": {
+                "min_clients_per_round": 0,
+                "max_flagged_ratio": 1.0,
+            },
+            "logging": {
+                "require_signed_round_events": bool(self.cfg.require_verified_round_events),
+                "score_redaction": {
+                    "enabled": False,
+                    "decimals": 3,
+                },
+                "include_policy_in_report": True,
+            },
+        }
+        if not policy_path:
+            return policy
+
+        with open(policy_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        if policy_path.lower().endswith((".yaml", ".yml")):
+            try:
+                import yaml  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "YAML privacy policy requested but PyYAML is not installed. "
+                    "Install dependency 'pyyaml'."
+                ) from exc
+            loaded = yaml.safe_load(text)
+        else:
+            loaded = json.loads(text)
+
+        if not isinstance(loaded, dict):
+            raise RuntimeError("Privacy policy must be an object")
+
+        for section in ("runtime", "round_requirements", "logging"):
+            incoming = loaded.get(section, {}) or {}
+            if isinstance(incoming, dict):
+                policy[section].update(incoming)
+
         return policy
 
     def _load_hmac_attestation_keys(self) -> Dict[str, bytes]:
@@ -1099,12 +1280,22 @@ class GovernanceEngine:
             "global_auc": round(float(global_auc), 6),
             "trusted_clients": sorted(int(c) for c in (trusted or [])),
             "flagged_clients": sorted(int(c) for c in (flagged or [])),
-            "trust_scores": self._normalize_score_map(trust_scores),
-            "anomaly_scores": self._normalize_score_map(anomaly_scores),
+            "trust_scores": self._redact_scores_for_privacy(trust_scores),
+            "anomaly_scores": self._redact_scores_for_privacy(anomaly_scores),
             "attestation_algo": self._attest_algo,
             "attestation_key_id": self._attest_key_id,
         }
         return payload
+
+    def _redact_scores_for_privacy(self, raw: Dict[str, Any]) -> Dict[str, float]:
+        normalized = self._normalize_score_map(raw)
+        logging_cfg = self._privacy_policy.get("logging", {}) or {}
+        redaction = logging_cfg.get("score_redaction", {}) or {}
+        if not bool(redaction.get("enabled", False)):
+            return normalized
+        decimals = int(redaction.get("decimals", 3))
+        decimals = max(0, min(decimals, 8))
+        return {k: round(float(v), decimals) for k, v in normalized.items()}
 
     def _sign_attestation_payload(self, payload: Dict[str, Any]) -> str:
         canonical = self._attestation_digest(payload)
@@ -1138,3 +1329,28 @@ class GovernanceEngine:
             if k not in {"attestation_signature", "signature_verified"}
         }
         return json.dumps(signable, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _policy_digest(policy: Dict[str, Any]) -> str:
+        canonical = json.dumps(policy or {}, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _append_access_audit(
+        self,
+        event_type: str,
+        round_num: int,
+        data: Dict[str, Any],
+        actor: str,
+    ) -> None:
+        if not self.cfg.access_audit_enabled:
+            return
+        try:
+            self.gateway.append_audit_event(
+                event_type=event_type,
+                round_num=int(round_num),
+                data=dict(data or {}),
+                actor=actor,
+            )
+        except Exception:
+            # Access-audit emission is best-effort; never break governance flow.
+            return

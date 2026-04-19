@@ -127,6 +127,10 @@ class TrustWeightedFedAvg(Strategy):
         self._round_event_key: bytes = os.getenv("BATFL_ROUND_EVENT_KEY", "batfl-dev-round-event-key").encode("utf-8")
         self.best_f1:     float = 0.0
         self.best_round:  int   = 0
+        self._current_round_model_hash: str = ""
+        self._committed_model_hash: str = ""
+        self._committed_chain_round: int = 0
+        self._committed_tx_id: str = ""
 
         os.makedirs(log_dir, exist_ok=True)
         if os.path.exists(self.round_event_log_path):
@@ -151,14 +155,26 @@ class TrustWeightedFedAvg(Strategy):
 
         sample_size = max(1, int(self.num_clients * self.fraction_fit))
         clients     = client_manager.sample(num_clients=sample_size, min_num_clients=sample_size)
-        config      = {"server_round": server_round}
+        config: Dict[str, Scalar] = {
+            "server_round": server_round,
+            "expected_model_hash": self._committed_model_hash,
+            "require_model_hash_verification": bool(self._committed_model_hash),
+            "expected_chain_round": self._committed_chain_round,
+            "expected_commit_tx": self._committed_tx_id,
+        }
         return [(client, fl.common.FitIns(parameters, config)) for client in clients]
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         """Select clients for federated evaluation."""
         sample_size = max(1, int(self.num_clients * self.fraction_evaluate))
         clients     = client_manager.sample(num_clients=sample_size, min_num_clients=sample_size)
-        config      = {"server_round": server_round}
+        config: Dict[str, Scalar] = {
+            "server_round": server_round,
+            "expected_model_hash": self._current_round_model_hash,
+            "require_model_hash_verification": bool(self._current_round_model_hash),
+            "expected_chain_round": self._committed_chain_round,
+            "expected_commit_tx": self._committed_tx_id,
+        }
         return [(client, fl.common.EvaluateIns(parameters, config)) for client in clients]
 
     def evaluate(self, server_round, parameters):
@@ -247,6 +263,7 @@ class TrustWeightedFedAvg(Strategy):
 
         # -- Compute model hash for blockchain audit trail (Split 3) -----------
         model_hash = self._hash_params(aggregated_params)
+        self._current_round_model_hash = model_hash
         print(f"\n  [ModelHash] {model_hash[:16]}...  (-> Split 3 blockchain log)")
 
         # -- Save pending round metadata (finalized after evaluate) ------------
@@ -369,6 +386,7 @@ class TrustWeightedFedAvg(Strategy):
                 try:
                     gov_record = self.governance_engine.process_round(round_log)
                     round_log.update({
+                        "chain_round": gov_record.chain_round,
                         "blockchain_tx_id": gov_record.blockchain_tx_id,
                         "audit_tx_id": gov_record.audit_tx_id,
                         "quarantined_clients": gov_record.quarantined_clients,
@@ -385,9 +403,16 @@ class TrustWeightedFedAvg(Strategy):
                     raise RuntimeError(
                         f"[Module 2] Governance failure at round {server_round}: {_ge}"
                     ) from _ge
+                self._committed_model_hash = str(round_log.get("model_hash", ""))
+                self._committed_chain_round = int(round_log.get("chain_round", server_round) or server_round)
+                self._committed_tx_id = str(round_log.get("blockchain_tx_id", ""))
             else:
+                round_log.setdefault("chain_round", server_round)
                 round_log.setdefault("blockchain_tx_id", "")
                 round_log.setdefault("audit_tx_id", "")
+                self._committed_model_hash = str(round_log.get("model_hash", ""))
+                self._committed_chain_round = int(round_log.get("chain_round", server_round) or server_round)
+                self._committed_tx_id = ""
 
             self.round_logs.append(round_log)
             self.event_storage.append_round_event(round_log)
