@@ -43,6 +43,8 @@ def build_governance_engine(
     enabled: bool = True,
     strict: bool = True,
     policy_path: Optional[str] = None,
+    privacy_policy_path: Optional[str] = None,
+    enforce_privacy_policy: bool = False,
 ):
     """
     Build and return a GovernanceEngine for Module 2 blockchain integration.
@@ -94,6 +96,8 @@ def build_governance_engine(
         fail_on_commit_error    = strict,
         require_verified_round_events = strict,
         policy_path             = policy_path,
+        privacy_policy_path     = privacy_policy_path,
+        enforce_privacy_policy  = enforce_privacy_policy,
         output_dir              = output_dir,
     )
 

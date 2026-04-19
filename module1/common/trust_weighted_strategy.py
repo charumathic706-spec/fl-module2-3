@@ -379,6 +379,7 @@ class TrustWeightedFedAvg(Strategy):
                         "attestation_algo": gov_record.attestation_algo,
                         "attestation_signature": gov_record.attestation_signature,
                         "policy_violations": gov_record.policy_violations,
+                        "privacy_violations": gov_record.privacy_violations,
                     })
                 except Exception as _ge:
                     raise RuntimeError(

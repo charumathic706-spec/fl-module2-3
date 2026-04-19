@@ -560,6 +560,40 @@
     </section>
 
     <section class="glass-panel impl-card">
+      <div class="section-title" style="margin-top: 0">Privacy Governance</div>
+      <table class="ledger-table">
+        <thead>
+          <tr><th>Field</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Privacy Enabled</td><td class="mono" id="privacy-enabled">n/a</td></tr>
+          <tr><td>Enforce Mode</td><td class="mono" id="privacy-enforce-mode">n/a</td></tr>
+          <tr><td>Policy Path</td><td class="mono" id="privacy-policy-path">n/a</td></tr>
+          <tr><td>Privacy Report</td><td class="mono" id="privacy-report-path">n/a</td></tr>
+          <tr><td>All Rounds Compliant</td><td class="mono" id="privacy-all-compliant">n/a</td></tr>
+          <tr><td>Rounds With Violations</td><td class="mono" id="privacy-rounds-violations">0</td></tr>
+          <tr><td>Total Violations</td><td class="mono" id="privacy-total-violations">0</td></tr>
+          <tr><td>Reported Rounds</td><td class="mono" id="privacy-total-rounds">0</td></tr>
+        </tbody>
+      </table>
+      <div style="margin-top: 12px; color: var(--text-muted); font-size: 11px;">
+        The privacy panel is read directly from <span class="mono">governance_output/privacy_report.json</span> so it stays in sync with Split 3.
+      </div>
+    </section>
+
+    <section class="glass-panel impl-card">
+      <div class="section-title" style="margin-top: 0">Privacy Violation Timeline</div>
+      <table class="ledger-table">
+        <thead>
+          <tr><th>Round</th><th>Violations</th></tr>
+        </thead>
+        <tbody id="privacy-violation-body">
+          <tr><td colspan="2" style="color: var(--text-muted);">No privacy violations recorded.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="glass-panel impl-card">
       <div class="section-title" style="margin-top: 0">Model Quality and Threshold Details</div>
       <table class="ledger-table">
         <thead>
@@ -789,6 +823,8 @@ function updateBlockchainSummary(state) {
     : `${state.attestation_verified ? 'OK' : 'FAILED'}${state.attestation_key_id ? ` | ${state.attestation_key_id}` : ''}`;
   const policyViolations = Array.isArray(state.policy_violations) ? state.policy_violations : [];
   const quarantinedClients = Array.isArray(state.quarantined_clients) ? state.quarantined_clients : [];
+  const privacySummary = state.privacy_summary || {};
+  const privacyRounds = Array.isArray(state.privacy_round_violations) ? state.privacy_round_violations : [];
   const protectionLabel = state.attestation_algo
     ? `SIGNED (${state.attestation_algo})`
     : 'SIGNED (algorithm unavailable)';
@@ -859,6 +895,19 @@ function updateBlockchainSummary(state) {
   document.getElementById('sec-hash-entries').textContent = String(Number(bc.hash_chain_entries || 0));
   document.getElementById('sec-backend-evidence').textContent = bc.backend_reason || 'n/a';
 
+  const privacyEnabled = Boolean(state.privacy_enabled);
+  const privacyEnforceMode = Boolean(state.privacy_enforce_mode);
+  document.getElementById('privacy-enabled').textContent = privacyEnabled ? 'YES' : 'NO';
+  document.getElementById('privacy-enforce-mode').textContent = privacyEnforceMode ? 'ENFORCED' : 'REPORT ONLY';
+  document.getElementById('privacy-policy-path').textContent = state.privacy_policy_path || 'n/a';
+  document.getElementById('privacy-report-path').textContent = state.privacy_report_path || 'n/a';
+  document.getElementById('privacy-all-compliant').textContent = privacySummary.all_rounds_compliant === undefined
+    ? 'n/a'
+    : (privacySummary.all_rounds_compliant ? 'YES' : 'NO');
+  document.getElementById('privacy-rounds-violations').textContent = String(Number(privacySummary.rounds_with_violations || 0));
+  document.getElementById('privacy-total-violations').textContent = String(Number(privacySummary.total_privacy_violations || 0));
+  document.getElementById('privacy-total-rounds').textContent = String(Number(privacySummary.total_rounds || 0));
+
   const tamperBanner = document.getElementById('tamper-banner');
   const tamperDetected = Boolean(state.tamper_detected);
   tamperBanner.style.display = tamperDetected ? 'block' : 'none';
@@ -882,10 +931,14 @@ function updateBlockchainSummary(state) {
 
   const body = document.getElementById('impl-commit-body');
   const quarantineBody = document.getElementById('impl-quarantine-body');
+  const privacyBody = document.getElementById('privacy-violation-body');
   const commits = Array.isArray(bc.recent_commits) ? bc.recent_commits : [];
   if (!commits.length) {
     body.innerHTML = '<tr><td colspan="5" style="color: var(--text-muted);">No commit data yet. Run Split 2 with blockchain enabled and governance output will appear here.</td></tr>';
     quarantineBody.innerHTML = '<tr><td colspan="3" style="color: var(--text-muted);">No quarantine events yet.</td></tr>';
+    privacyBody.innerHTML = privacyRounds.length
+      ? privacyRounds.map((rec) => `<tr><td>${rec.round || 0}</td><td class="mono">${Array.isArray(rec.privacy_violations) ? rec.privacy_violations.join(' | ') : 'n/a'}</td></tr>`).join('')
+      : '<tr><td colspan="2" style="color: var(--text-muted);">No privacy violations recorded.</td></tr>';
     return;
   }
 
@@ -924,6 +977,19 @@ function updateBlockchainSummary(state) {
     quarantineBody.innerHTML = quarantineRows.join('');
   } else {
     quarantineBody.innerHTML = '<tr><td colspan="3" style="color: var(--text-muted);">No quarantine events yet.</td></tr>';
+  }
+
+  if (privacyRounds.length > 0) {
+    privacyBody.innerHTML = privacyRounds
+      .slice()
+      .sort((a, b) => (b.round || 0) - (a.round || 0))
+      .map((rec) => `<tr>
+        <td>${rec.round || 0}</td>
+        <td class="mono">${Array.isArray(rec.privacy_violations) ? rec.privacy_violations.join(' | ') : 'n/a'}</td>
+      </tr>`)
+      .join('');
+  } else {
+    privacyBody.innerHTML = '<tr><td colspan="2" style="color: var(--text-muted);">No privacy violations recorded.</td></tr>';
   }
 }
 

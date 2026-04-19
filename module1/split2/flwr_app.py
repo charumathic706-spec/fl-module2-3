@@ -126,6 +126,8 @@ def _build_server_components(context: Context) -> ServerAppComponents:
 
     blockchain_enabled = _to_bool(cfg.get("blockchain_enabled", True), True)
     blockchain_backend = str(cfg.get("blockchain_backend", "fabric"))
+    privacy_policy_path = str(cfg.get("privacy_policy", "")).strip() or None
+    enforce_privacy_policy = _to_bool(cfg.get("enforce_privacy_policy", False), False)
 
     governance_engine = None
     if blockchain_enabled:
@@ -134,6 +136,8 @@ def _build_server_components(context: Context) -> ServerAppComponents:
             backend=blockchain_backend,
             enabled=True,
             strict=True,
+            privacy_policy_path=privacy_policy_path,
+            enforce_privacy_policy=enforce_privacy_policy,
         )
 
     strategy = get_trust_strategy(

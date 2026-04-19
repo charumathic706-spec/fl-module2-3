@@ -21,8 +21,10 @@ def _dataset_fingerprint(X: np.ndarray, y: np.ndarray) -> str:
     h = hashlib.sha256()
     h.update(str(X.shape).encode("utf-8"))
     h.update(str(y.shape).encode("utf-8"))
-    h.update(np.asarray(X[: min(len(X), 1024)], dtype=np.float32).tobytes())
-    h.update(np.asarray(y[: min(len(y), 4096)], dtype=np.int32).tobytes())
+    h.update(str(X.dtype).encode("utf-8"))
+    h.update(str(y.dtype).encode("utf-8"))
+    h.update(np.ascontiguousarray(X).tobytes())
+    h.update(np.ascontiguousarray(y).tobytes())
     return h.hexdigest()
 
 

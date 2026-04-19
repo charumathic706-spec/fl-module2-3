@@ -148,6 +148,12 @@ class LogWatcher:
           "round_event_sequence": 0,
           "policy_violations": [],
           "quarantined_clients": [],
+          "privacy_enabled": False,
+          "privacy_policy_path": "",
+          "privacy_enforce_mode": False,
+          "privacy_report_path": "",
+          "privacy_summary": {},
+          "privacy_round_violations": [],
           "tamper_detected": False,
           "tamper_events": 0,
           "rounds": [],
@@ -295,6 +301,12 @@ class LogWatcher:
         "round_event_sequence": int(latest_event_payload.get("event_sequence", 0) or 0),
         "policy_violations": policy_violations,
         "quarantined_clients": quarantined_clients,
+        "privacy_enabled": bool(blockchain_state.get("privacy_enabled", False)),
+        "privacy_policy_path": str(blockchain_state.get("privacy_policy_path", "")),
+        "privacy_enforce_mode": bool(blockchain_state.get("privacy_enforce_mode", False)),
+        "privacy_report_path": str(blockchain_state.get("privacy_report_path", "")),
+        "privacy_summary": blockchain_state.get("privacy_summary", {}) or {},
+        "privacy_round_violations": blockchain_state.get("privacy_round_violations", []) or [],
         "tamper_detected": bool(blockchain_state.get("chain_intact") is False or int(blockchain_state.get("tamper_events", 0) or 0) > 0),
         "tamper_events": int(blockchain_state.get("tamper_events", 0) or 0),
         "blockchain": blockchain_state,
@@ -349,6 +361,12 @@ class LogWatcher:
             "fabric_peer_org1": "",
             "fabric_peer_org2": "",
             "source": "none",
+            "privacy_enabled": False,
+            "privacy_policy_path": "",
+            "privacy_enforce_mode": False,
+            "privacy_report_path": "",
+            "privacy_summary": {},
+            "privacy_round_violations": [],
         }
 
         gov_dir = self._find_governance_dir()
@@ -425,6 +443,19 @@ class LogWatcher:
                 state["backend_reason"] = "eth_deployment.json present (fallback inference)"
             elif state["backend"] != "ganache":
                 state["backend_reason"] += "; eth_deployment.json also present"
+
+        privacy_path = os.path.join(gov_dir, "privacy_report.json")
+        privacy_report = self._safe_json(privacy_path)
+        if isinstance(privacy_report, dict):
+          privacy_summary = privacy_report.get("summary", {}) or {}
+          state["privacy_enabled"] = True
+          state["privacy_policy_path"] = str(privacy_report.get("policy_path", ""))
+          state["privacy_enforce_mode"] = bool(privacy_report.get("enforce_mode", False))
+          state["privacy_report_path"] = privacy_path
+          state["privacy_summary"] = privacy_summary
+          state["privacy_round_violations"] = privacy_report.get("round_violations", []) or []
+          if state["backend_reason"] == "No governance artifacts found":
+            state["backend_reason"] = "privacy_report.json present"
 
         if state["backend"] == "fabric":
             fabric_meta = self._read_fabric_env()
